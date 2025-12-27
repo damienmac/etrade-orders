@@ -28,9 +28,9 @@ today = datetime.datetime.now()
 # Get first day of the current year
 first_day_of_year = datetime.datetime(today.year, 1, 1)
 
-# Format dates as MMDDYYYY
-from_date = first_day_of_year.strftime("%m%d%Y")
-to_date = today.strftime("%m%d%Y")
+# Format dates as datetime, not MMDDYYYY
+from_date = first_day_of_year
+to_date = today
 
 action_map = {
     "BUY_OPEN": "Buy Open",
@@ -124,11 +124,12 @@ def orders():
     done = False
     marker = 0
     while not done:
-        order_response = etrade_order.list_orders(account_id_key,
+        order_response = (etrade_order.list_orders(account_id_key,
                                                   marker=marker,
                                                   count=100,
-                                                  fromDate=from_date,
-                                                  toDate=to_date).get("OrdersResponse", {})
+                                                  from_date=from_date,
+                                                  to_date=to_date)
+                          .get("OrdersResponse", {}))
         marker = order_response.get("marker")
         done = not bool(marker)
         for order in order_response.get("Order", []):
