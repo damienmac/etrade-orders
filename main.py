@@ -37,6 +37,8 @@ action_map = {
     "BUY_CLOSE": "Buy Close",
     "SELL_OPEN": "Sell Open",
     "SELL_CLOSE": "Sell Close",
+    "BUY": "Buy",
+    "SELL": "Sell",
 }
 
 
@@ -150,10 +152,16 @@ def orders():
                     action = action_map.get(action, "!NO ACTION")
                     quantity = int(instrument.get("filledQuantity", "!NO QUANTITY"))
                     price = Decimal(str(instrument.get("averageExecutionPrice", "0.00")))
-                    if "Buy" in action:
+                    if "Buy Open" == action:
                         total_in = 0
                         total_out = (price * 100) * quantity * -1
-                    else:
+                    elif "Buy" == action:
+                        total_in = 0
+                        total_out = price * quantity * -1
+                    elif "Sell" == action:
+                        total_in = price * quantity
+                        total_out = 0
+                    else:  # Sell Close
                         total_in = (price * 100) * quantity
                         total_out = 0
                     # print(f"{symbol},  {formatted_time}, {action},  {quantity},  {price}")
@@ -167,7 +175,7 @@ def orders():
                         "total_in": total_in,
                         "total_out": total_out,
                     }
-                    if "Close" in action:
+                    if "Close" in action or "Sell" == action:
                         closes.append(row)
                         # print(f"CLOSES <-- {row}")
                     else:
