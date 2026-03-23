@@ -18,17 +18,6 @@ Your active PROD API key is: 86b...9ef, and secret is: bb7...0c2.
 # Load properties from etrade.properties file
 props = load_properties()
 
-# SANDBOX
-# consumer_key = "6de91a7d784d04f03e9ebca205f60f59"
-# consumer_secret = "06b90b529bf69fc62b83b58a7ba810d603b6b08e22fe081623b4f3ed08d232ee"
-
-# PRODUCTION
-# These values are now loaded from etrade.properties
-# consumer_key = "86b4df7b6750587fb3108e2e6cf9e9ef"
-# consumer_secret = "bb793d253ece4abb58bb8ba4ac652e2ffffaf9b9aa774538ca7f1d1d41c980c2"
-
-
-
 def get_tokens():
     # Get properties from the file
     properties = load_properties()

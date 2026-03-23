@@ -1,9 +1,9 @@
+import sys
 import time
 from decimal import Decimal
-import os
+from typing import Tuple
 
 import pyetrade
-# import json
 from properties import load_properties
 
 # Try to import tokens from etrade_tokens.py
@@ -11,10 +11,9 @@ try:
     from etrade_tokens import tokens
     print("Using tokens from etrade_tokens.py")
 except ImportError:
-    print("Warning: etrade_tokens.py not found. Please run tokens.py first to generate tokens.")
-    print("For now, using hardcoded tokens (these may be expired).")
-    # Fallback to hardcoded tokens for backward compatibility
-    tokens = {'oauth_token': 'niAK9kR9X8lggdBbkGgNvLz+GljdRtZwdqZsYEqBcpI=', 'oauth_token_secret': 'g/oW/d1Xi5YLGKWF8ly0LRSw3IEIkcytmy2tW0JyPgo='}
+    print("Error: etrade_tokens.py not found. Please run tokens.py first to generate tokens.")
+    tokens = {}  # Define for linting purposes before exiting
+    sys.exit(1)
 
 """
 from_date = The earliest date to include in the date range, formatted as MMDDYYYY
@@ -42,25 +41,18 @@ action_map = {
 }
 
 
-def orders():
-    # For storing output
-    output_lines = []
 
+def get_account_info(consumer_key: str, consumer_secret: str, account_id: str) -> str:
+    """
+    Retrieves E*TRADE account information based on credentials provided.
+
+    :param consumer_key: The E*TRADE consumer key.
+    :param consumer_secret: The E*TRADE consumer secret.
+    :param account_id: The E*TRADE account ID.
+    :return: The accountIdKey for the specified account.
+    :raises SystemExit: If API credentials or account information cannot be retrieved.
+    """
     try:
-        # Get properties from the file
-        properties = load_properties()
-        if not properties:
-            print("Error: Failed to load properties. Please check your etrade.properties file.")
-            return
-
-        consumer_key = properties.get('consumer_key')
-        consumer_secret = properties.get('consumer_secret')
-        output_file = properties.get('output_file')
-
-        if not consumer_key or not consumer_secret:
-            print("Error: Missing API credentials. Please check your etrade.properties file.")
-            return
-
         # Setting up the object used for Accounts activity
         # Arg dev determines the environment Sandbox (dev=True)
         # or Live/Production (dev=False)
@@ -74,7 +66,7 @@ def orders():
         )
     except Exception as e:
         print(f"Error initializing E*TRADE API: {e}")
-        return
+        sys.exit(1)
 
     try:
         accounts_list = etrade_accounts.list_accounts(resp_format='json')
@@ -87,13 +79,7 @@ def orders():
 
         if not accounts:
             print("Error: No accounts found or unexpected API response format.")
-            return
-
-        # Get account ID from properties
-        account_id = properties.get('account_id')
-        if not account_id:
-            print("Error: No account_id specified in etrade.properties file.")
-            return
+            sys.exit(1)
 
         # Find the account with the specified ID
         matching_accounts = [a for a in accounts if a.get("accountId") == account_id]
@@ -101,26 +87,35 @@ def orders():
             print(f"Error: Account with ID {account_id} not found. Available accounts:")
             for a in accounts:
                 print(f"  - {a.get('accountId')}: {a.get('accountName')}")
-            return
+            sys.exit(1)
 
         account = matching_accounts[0]
         account_id_key = account.get("accountIdKey", "")
         if not account_id_key:
             print(f"Error: Could not retrieve accountIdKey for account {account_id}.")
-            return
+            sys.exit(1)
+
+        return account_id_key
     except Exception as e:
         print(f"Error retrieving account information: {e}")
-        return
+        sys.exit(1)
 
-    etrade_order = pyetrade.order.ETradeOrder(
-        consumer_key,
-        consumer_secret,
-        tokens['oauth_token'],
-        tokens['oauth_token_secret'],
-        # dev=True  # Sandbox
-        dev=False  # Production
-    )
 
+def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
+                          account_id_key: str,
+                          from_dt: datetime.datetime,
+                          to_dt: datetime.datetime,
+                          action_mapping: dict) -> Tuple[list, list]:
+    """
+    Fetches EXECUTED orders from E*TRADE and separates them into opens and closes.
+
+    :param etrade_order: The ETradeOrder API object.
+    :param account_id_key: The account identifier key.
+    :param from_dt: The earliest date to include in the date range.
+    :param to_dt: The latest date to include in the date range.
+    :param action_mapping: A dictionary mapping API actions to display actions.
+    :return: A tuple containing (opens, closes) lists.
+    """
     opens = []
     closes = []
     done = False
@@ -129,8 +124,8 @@ def orders():
         order_response = (etrade_order.list_orders(account_id_key,
                                                   marker=marker,
                                                   count=100,
-                                                  from_date=from_date,
-                                                  to_date=to_date)
+                                                  from_date=from_dt,
+                                                  to_date=to_dt)
                           .get("OrdersResponse", {}))
         marker = order_response.get("marker")
         done = not bool(marker)
@@ -149,7 +144,7 @@ def orders():
                 for instrument in instruments:
                     symbol = instrument.get("symbolDescription", "!NO SYMBOL")
                     action = instrument.get("orderAction", "!NO ACTION")
-                    action = action_map.get(action, "!NO ACTION")
+                    action = action_mapping.get(action, "!NO ACTION")
                     quantity = int(instrument.get("filledQuantity", "!NO QUANTITY"))
                     price = Decimal(str(instrument.get("averageExecutionPrice", "0.00")))
                     if "Buy Open" == action:
@@ -181,7 +176,17 @@ def orders():
                     else:
                         opens.append(row)
                         # print(f"OPENS <-- {row}")
+    return opens, closes
 
+
+def match_trades(opens: list, closes: list) -> list:
+    """
+    Matches opening and closing trades by symbol.
+
+    :param opens: List of opening trades.
+    :param closes: List of closing trades.
+    :return: A list of matched trade dictionaries.
+    """
     # I want the oldest first
     closes.reverse()
     opens.reverse()
@@ -222,42 +227,61 @@ def orders():
         }
         combined.append(match)
         # print(f"COMBINED3 <-- {match}")
+    return combined
+
+
+def format_output(combined: list) -> list:
+    """
+    Formats the matched trades into CSV lines, separating puts into their own section.
+
+    :param combined: List of matched trade dictionaries.
+    :return: A list of formatted CSV strings.
+    """
+    output_lines = []
+    
+    # Add CSV header
+    header = "Symbol,Open Date,Open Action,Open Quantity,Open Price,,Open Total Out,Open Total In,,Close Date,Close Action,Close Quantity,Close Price,,Close Total In,Close Total Out"
+    output_lines.append(header)
 
     puts = []
+    others = []
+    
     for row in sorted(combined, key=lambda x: (x['symbol'], x['epoch'])):
         o = row['open']
         c = row['close']
-
-        # trying to do puts, mostly short puts, in a separate block.
         if (o and 'Put' in o.get('symbol')) or (c and 'Put' in c.get('symbol')):
             puts.append(row)
         else:
-            if o and c:
-                output_lines.append(f"{o.get('symbol')},{o.get('date')},{o.get('action')},{o.get('quantity')},{o.get('price')},,{o.get('total_out')},{o.get('total_in')},,{c.get('date')},{c.get('action')},{c.get('quantity')},{c.get('price')},,{c.get('total_in')},{c.get('total_out')}")
-            elif o and not c:
-                output_lines.append(f"{o.get('symbol')},{o.get('date')},{o.get('action')},{o.get('quantity')},{o.get('price')},,{o.get('total_out')},{o.get('total_in')},,,,,,")
-            elif not o and c:
-                output_lines.append(f"{c.get('symbol')},,,,,,,,,{c.get('date')},{c.get('action')},{c.get('quantity')},{c.get('price')},,{c.get('total_in')},{c.get('total_out')}")
-            else:
-                assert False, f"Empty row? {row}"
+            others.append(row)
 
-    for row in sorted(puts, key=lambda x: (x['symbol'], x['epoch'])):
+    def format_row(row):
         o = row['open']
         c = row['close']
         if o and c:
-            output_lines.append(f"{o.get('symbol')},{o.get('date')},{o.get('action')},{o.get('quantity')},{o.get('price')},,{o.get('total_out')},{o.get('total_in')},,{c.get('date')},{c.get('action')},{c.get('quantity')},{c.get('price')},,{c.get('total_in')},{c.get('total_out')}")
+            return f"{o.get('symbol')},{o.get('date')},{o.get('action')},{o.get('quantity')},{o.get('price')},,{o.get('total_out')},{o.get('total_in')},,{c.get('date')},{c.get('action')},{c.get('quantity')},{c.get('price')},,{c.get('total_in')},{c.get('total_out')}"
         elif o and not c:
-            output_lines.append(f"{o.get('symbol')},{o.get('date')},{o.get('action')},{o.get('quantity')},{o.get('price')},,{o.get('total_out')},{o.get('total_in')},,,,,,")
+            return f"{o.get('symbol')},{o.get('date')},{o.get('action')},{o.get('quantity')},{o.get('price')},,{o.get('total_out')},{o.get('total_in')},,,,,,"
         elif not o and c:
-            output_lines.append(f"{c.get('symbol')},,,,,,,,,{c.get('date')},{c.get('action')},{c.get('quantity')},{c.get('price')},,{c.get('total_in')},{c.get('total_out')}")
+            return f"{c.get('symbol')},,,,,,,,,{c.get('date')},{c.get('action')},{c.get('quantity')},{c.get('price')},,{c.get('total_in')},{c.get('total_out')}"
         else:
             assert False, f"Empty row? {row}"
 
-    # Add CSV header
-    header = "Symbol,Open Date,Open Action,Open Quantity,Open Price,,Open Total Out,Open Total In,,Close Date,Close Action,Close Quantity,Close Price,,Close Total In,Close Total Out"
-    output_lines.insert(0, header)
+    for row in others:
+        output_lines.append(format_row(row))
+        
+    for row in puts:
+        output_lines.append(format_row(row))
+        
+    return output_lines
 
-    # Output results
+
+def write_output(output_lines: list, output_file: str = None):
+    """
+    Writes the output lines to a file or the console.
+
+    :param output_lines: List of formatted CSV strings.
+    :param output_file: The path to the output file (optional).
+    """
     if output_file:
         try:
             with open(output_file, 'w') as f:
@@ -275,6 +299,82 @@ def orders():
             print(line)
 
 
+def orders(consumer_key: str, consumer_secret: str, account_id_key: str, output_file: str = None):
+    """
+    Main orchestration logic for fetching and processing orders.
+
+    :param consumer_key: The E*TRADE consumer key.
+    :param consumer_secret: The E*TRADE consumer secret.
+    :param account_id_key: The E*TRADE account ID key.
+    :param output_file: Optional path to the output CSV file.
+    """
+    etrade_order = pyetrade.order.ETradeOrder(
+        consumer_key,
+        consumer_secret,
+        tokens['oauth_token'],
+        tokens['oauth_token_secret'],
+        # dev=True  # Sandbox
+        dev=False  # Production
+    )
+
+    opens, closes = fetch_executed_orders(
+        etrade_order,
+        account_id_key,
+        from_dt=from_date,
+        to_dt=to_date,
+        action_mapping=action_map
+    )
+
+    combined = match_trades(opens, closes)
+
+    output_lines = format_output(combined)
+
+    write_output(output_lines, output_file)
+
+
+def main():
+    """
+    Entry point for the script. Loads and validates properties before starting the order processing.
+    """
+    # Get properties from the file
+    properties = load_properties()
+    if not properties:
+        print("Error: Failed to load properties. Please check your etrade.properties file.")
+        sys.exit(1)
+
+    consumer_key = properties.get('consumer_key')
+    consumer_secret = properties.get('consumer_secret')
+    account_id = properties.get('account_id')
+    output_file = properties.get('output_file')
+
+    # Validate parameters
+    missing = []
+    if not consumer_key:
+        missing.append("consumer_key")
+    if not consumer_secret:
+        missing.append("consumer_secret")
+    if not account_id:
+        missing.append("account_id")
+
+    if missing:
+        print(f"Error: Missing or empty required properties in etrade.properties: {', '.join(missing)}")
+        sys.exit(1)
+
+    # Get the account ID key needed for API calls
+    account_id_key = get_account_info(
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        account_id=account_id
+    )
+
+    orders(
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        account_id_key=account_id_key,
+        output_file=output_file
+    )
+
+
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    orders()
+    main()
