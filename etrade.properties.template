@@ -7,16 +7,16 @@
 
 
 # SANDBOX
-# consumer_key = "6de...f59"
-# consumer_secret = "06b...2ee"
+# consumer_key = "YOUR_SANDBOX_KEY"
+# consumer_secret = "YOUR_SANDBOX_SECRET"
 
 # PRODUCTION
-consumer_key = "86b...9ef"
-consumer_secret = "bb7...0c2"
+consumer_key = "YOUR_PRODUCTION_KEY"
+consumer_secret = "YOUR_PRODUCTION_SECRET"
 
 # Account configuration
-account_id = "<your-account-id>"
+account_id = "YOUR_ACCOUNT_ID"
 
 # Output configuration
 # Uncomment and set this to save output to a file instead of printing to console
-# output_file = "orders_output.csv"
+output_file = "orders_output.csv"

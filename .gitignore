@@ -1,3 +1,6 @@
 etrade_tokens.py
+etrade.properties
+etrade.properties.mine
+orders_output.*
 .idea
 __pycache*

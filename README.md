@@ -13,23 +13,27 @@ This tool allows you to capture your E*TRADE orders using the E*TRADE API. It re
 
 ### 1. Configure API Credentials
 
-Before using this tool, you need to edit the `etrade.properties` file with your E*TRADE API credentials:
+Before using this tool, you need to set up your `etrade.properties` file with your E*TRADE API credentials:
 
-1. Open `etrade.properties` in a text editor
-2. Replace the placeholder values with your actual API credentials:
+1. Copy the template file to create your own properties file:
+   ```bash
+   cp etrade.properties.template etrade.properties
+   ```
+2. Open `etrade.properties` in a text editor.
+3. Replace the placeholder values with your actual API credentials:
    ```
    consumer_key = "your_consumer_key_here"
    consumer_secret = "your_consumer_secret_here"
    ```
-3. Configure your account ID:
+4. Configure your account ID:
    ```
    account_id = "your_account_id_here"
    ```
-4. (Optional) Configure output to a file:
+5. (Optional) Configure output to a file:
    ```
    output_file = "orders_output.csv"
    ```
-5. Save the file
+6. Save the file.
 
 ### 2. Generate Authentication Tokens
 
