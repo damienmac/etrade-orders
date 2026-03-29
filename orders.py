@@ -3,13 +3,14 @@ import datetime
 from decimal import Decimal
 from typing import Tuple
 import pyetrade
+import pandas as pd
 
-# Use current date range (first day of the year to today)
+# Use current date range (two years ago to today)
 today = datetime.datetime.now()
-first_day_of_year = datetime.datetime(today.year, 1, 1)
+two_years_ago = today - datetime.timedelta(days=365*2)
 
 # Format dates as datetime, not MMDDYYYY
-from_date = first_day_of_year
+from_date = two_years_ago
 to_date = today
 
 action_map = {
@@ -97,6 +98,92 @@ def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
                         opens.append(row)
                         # print(f"OPENS <-- {row}")
     return opens, closes
+
+
+def parse_expiration_date(symbol: str) -> datetime.datetime:
+    """Parses expiration date from a human-readable option symbol description."""
+    try:
+        if ' Call' not in symbol and ' Put' not in symbol:
+            return None
+        parts = symbol.split(' ')
+        # Symbol example: "AAPL Apr 17 '25 $200 Call"
+        # parts: ["AAPL", "Apr", "17", "'25", "$200", "Call"]
+        if len(parts) < 4:
+            return None
+        # We assume the month and day are at indices 1 and 2, and year at index 3
+        month_str = parts[1]
+        day_str = parts[2]
+        year_str = parts[3].strip("'")
+        date_str = f"{month_str} {day_str} {year_str}"
+        return datetime.datetime.strptime(date_str, "%b %d %y")
+    except (ValueError, IndexError):
+        return None
+
+
+def add_expired_worthless_orders(opens: list, closes: list):
+    """Adds synthetic closing orders for options that expired worthless."""
+    now = datetime.datetime.now()
+    
+    # Track how many closes we already have for each symbol
+    existing_closes_count = {}
+    for c in closes:
+        symbol = c['symbol']
+        existing_closes_count[symbol] = existing_closes_count.get(symbol, 0) + 1
+        
+    # We want to add synthetic closes for any open that doesn't have a matching close
+    # and has expired.
+    
+    # First, let's count the opens
+    opens_count = {}
+    for o in opens:
+        symbol = o['symbol']
+        opens_count[symbol] = opens_count.get(symbol, 0) + 1
+        
+    # Now, for each symbol, if opens > closes and it's an expired option, 
+    # add (opens - closes) synthetic closes.
+    for symbol, count in opens_count.items():
+        exp_date = parse_expiration_date(symbol)
+        if exp_date and exp_date < now:
+            num_closes = existing_closes_count.get(symbol, 0)
+            if count > num_closes:
+                # Get list of opens for this symbol to iterate through
+                matching_opens = [o for o in opens if o['symbol'] == symbol]
+                
+                # Check how many we need to create
+                needed = count - num_closes
+                # For simplicity, we can just pick the last ones (presumably the most recent)
+                # or just any. Since we want to pair them, we should probably use the quantities
+                # of the unmatched opens.
+                
+                # We'll create one synthetic close for each unmatched open
+                # But wait, which ones are unmatched? 
+                # Match_trades will find any.
+                # Let's just create 'needed' synthetic closes using the quantities of some opens.
+                for i in range(needed):
+                    o_to_use = matching_opens[i]
+                    action = o_to_use.get('action', '')
+                    if action == "Buy Open":
+                        close_action = "Sell Close"
+                    elif action == "Sell Open":
+                        close_action = "Buy Close"
+                    else:
+                        continue
+                    
+                    # E*Trade timestamps are in milliseconds.
+                    epoch = int(exp_date.timestamp() * 1000)
+                    
+                    synthetic_close = {
+                        "symbol": symbol,
+                        "date": exp_date.strftime("%m/%d/%Y"),
+                        "epoch": epoch,
+                        "action": close_action,
+                        "quantity": o_to_use.get('quantity'),
+                        "price": Decimal("0.00"),
+                        "total_in": 0,
+                        "total_out": 0,
+                        "is_expired": True,
+                    }
+                    closes.append(synthetic_close)
 
 
 def match_trades(opens: list, closes: list) -> list:
@@ -219,6 +306,147 @@ def write_output(output_lines: list, output_file: str = None):
             print(line)
 
 
+def write_excel_output(combined: list, output_file: str):
+    """
+    Writes the matched trades to an Excel file with data divided across multiple sheets.
+
+    :param combined: List of matched trade dictionaries.
+    :param output_file: The path to the output Excel file.
+    """
+    if not output_file:
+        print("No output file specified for Excel output.")
+        return
+
+    # If the output file is still .csv, change it to .xlsx
+    if output_file.lower().endswith('.csv'):
+        output_file = output_file[:-4] + '.xlsx'
+
+    rows = []
+    for entry in sorted(combined, key=lambda x: (x['symbol'], x['epoch'])):
+        o = entry['open']
+        c = entry['close']
+        
+        # Determine if it's a "sold put"
+        # A sold put is typically an opening transaction with "Sell Open" action and "Put" in symbol
+        is_sold_put = False
+        if o and 'Put' in o.get('symbol', '') and 'Sell Open' == o.get('action'):
+            is_sold_put = True
+        elif c and 'Put' in c.get('symbol', '') and not o:
+            # If we only have a close, we might not know for sure if it was a sold put 
+            # unless we look at the action. But the user defined "sold puts" as a category.
+            # Usually SELL_OPEN is the indicator for sold puts.
+            # For now, let's stick to the opening action if available.
+            pass
+
+        # Determine closing year
+        close_year = None
+        if c:
+            # executed_time is in milliseconds
+            close_time = datetime.datetime.fromtimestamp(c['epoch'] / 1000)
+            close_year = close_time.year
+        
+        row_data = {
+            "Symbol": (o or c).get('symbol'),
+            "Open Date": o.get('date') if o else None,
+            "Open Action": o.get('action') if o else None,
+            "Open Quantity": o.get('quantity') if o else None,
+            "Open Price": float(o.get('price')) if o else None,
+            "Open Total Out": float(o.get('total_out')) if o else None,
+            "Open Total In": float(o.get('total_in')) if o else None,
+            "Close Date": c.get('date') if c else None,
+            "Close Action": c.get('action') if c else None,
+            "Close Quantity": c.get('quantity') if c else None,
+            "Close Price": float(c.get('price')) if c else None,
+            "Close Total In": float(c.get('total_in')) if c else None,
+            "Close Total Out": float(c.get('total_out')) if c else None,
+            "EXPIRED": "EXPIRED" if c and c.get('is_expired') else "",
+            "_is_sold_put": is_sold_put,
+            "_close_year": close_year
+        }
+        rows.append(row_data)
+
+    df = pd.DataFrame(rows)
+    
+    this_year = datetime.datetime.now().year
+    year_minus_1 = this_year - 1
+    year_minus_2 = this_year - 2
+
+    # Partitioning logic
+    # sheet1: not sold puts, closed in year_minus_2
+    sheet1 = df[(~df['_is_sold_put']) & (df['_close_year'] == year_minus_2)]
+    
+    # sheet2: sold puts, closed in year_minus_2
+    sheet2 = df[(df['_is_sold_put']) & (df['_close_year'] == year_minus_2)]
+    
+    # sheet3: not sold puts, closed in year_minus_1
+    sheet3 = df[(~df['_is_sold_put']) & (df['_close_year'] == year_minus_1)]
+    
+    # sheet4: sold puts, closed in year_minus_1
+    sheet4 = df[(df['_is_sold_put']) & (df['_close_year'] == year_minus_1)]
+    
+    # sheet5: not sold puts, closed this year OR not closed
+    sheet5 = df[(~df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
+    
+    # sheet6: sold puts, closed this year OR not closed
+    sheet6 = df[(df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
+
+    # Remove helper columns before writing
+    cols_to_drop = ['_is_sold_put', '_close_year']
+    
+    # Dashboard calculations
+    def calculate_summary(df_partition, name):
+        # P/L = (Open Total In + Open Total Out) + (Close Total In + Close Total Out)
+        # Note: Open Total Out is negative for buys, Close Total In is positive for sells, etc.
+        # Summing them all up gives the net P/L.
+        pl = (df_partition['Open Total Out'].fillna(0) + 
+              df_partition['Open Total In'].fillna(0) + 
+              df_partition['Close Total In'].fillna(0) + 
+              df_partition['Close Total Out'].fillna(0)).sum()
+        
+        count = len(df_partition)
+        
+        # Win rate: only for closed trades (where Close Date is not null)
+        closed_trades = df_partition[df_partition['Close Date'].notna()]
+        if len(closed_trades) > 0:
+            trade_pls = (closed_trades['Open Total Out'].fillna(0) + 
+                         closed_trades['Open Total In'].fillna(0) + 
+                         closed_trades['Close Total In'].fillna(0) + 
+                         closed_trades['Close Total Out'].fillna(0))
+            wins = (trade_pls > 0).sum()
+            win_rate = f"{(wins / len(closed_trades)) * 100:.2f}%"
+        else:
+            win_rate = "N/A"
+            
+        return {
+            "Category": name,
+            "Total Trades": count,
+            "Closed Trades": len(closed_trades),
+            "Total P/L": round(pl, 2),
+            "Win Rate (Closed)": win_rate
+        }
+
+    summary_data = [
+        calculate_summary(sheet1, f"Trades {year_minus_2}"),
+        calculate_summary(sheet2, f"Short Puts {year_minus_2}"),
+        calculate_summary(sheet3, f"Trades {year_minus_1}"),
+        calculate_summary(sheet4, f"Short Puts {year_minus_1}"),
+        calculate_summary(sheet5, "Trades Current or Open"),
+        calculate_summary(sheet6, "Short Puts Current or Open"),
+    ]
+    dashboard_df = pd.DataFrame(summary_data)
+
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        dashboard_df.to_excel(writer, sheet_name='Dashboard', index=False)
+        sheet1.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Trades {year_minus_2}', index=False)
+        sheet2.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Short Puts {year_minus_2}', index=False)
+        sheet3.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Trades {year_minus_1}', index=False)
+        sheet4.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Short Puts {year_minus_1}', index=False)
+        sheet5.drop(columns=cols_to_drop).to_excel(writer, sheet_name='Trades Current or Open', index=False)
+        sheet6.drop(columns=cols_to_drop).to_excel(writer, sheet_name='Short Puts Current or Open', index=False)
+
+    print(f"Excel output saved to {output_file}")
+
+
 def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens: dict, output_file: str = None):
     """
     Main orchestration logic for fetching and processing orders.
@@ -227,7 +455,7 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
     :param consumer_secret: The E*TRADE consumer secret.
     :param account_id_key: The E*TRADE account ID key.
     :param tokens: A dictionary containing the E*TRADE OAuth tokens.
-    :param output_file: Optional path to the output CSV file.
+    :param output_file: Optional path to the output file.
     """
     etrade_order = pyetrade.order.ETradeOrder(
         consumer_key,
@@ -238,16 +466,24 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
         dev=False  # Production
     )
 
-    opens, closes = fetch_executed_orders(
-        etrade_order,
-        account_id_key,
-        from_dt=from_date,
-        to_dt=to_date,
-        action_mapping=action_map
-    )
+    try:
+        opens, closes = fetch_executed_orders(
+            etrade_order,
+            account_id_key,
+            from_dt=from_date,
+            to_dt=to_date,
+            action_mapping=action_map
+        )
+    except Exception as e:
+        if "401" in str(e):
+            print("\nError: E*TRADE API authentication failed (401 Unauthorized) while fetching orders.")
+            print("Your OAuth tokens have likely expired. Please run 'python tokens.py' to generate new tokens.")
+        else:
+            print(f"Error fetching orders from E*TRADE: {e}")
+        return
+
+    add_expired_worthless_orders(opens, closes)
 
     combined = match_trades(opens, closes)
 
-    output_lines = format_output(combined)
-
-    write_output(output_lines, output_file)
+    write_excel_output(combined, output_file)

@@ -19,4 +19,4 @@ account_id = "YOUR_ACCOUNT_ID"
 
 # Output configuration
 # Uncomment and set this to save output to a file instead of printing to console
-output_file = "orders_output.csv"
+output_file = "orders_output.xlsx"

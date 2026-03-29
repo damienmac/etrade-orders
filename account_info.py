@@ -57,5 +57,9 @@ def get_account_info(consumer_key: str, consumer_secret: str, account_id: str, t
 
         return account_id_key
     except Exception as e:
-        print(f"Error retrieving account information: {e}")
+        if "401" in str(e):
+            print("\nError: E*TRADE API authentication failed (401 Unauthorized).")
+            print("Your OAuth tokens have likely expired. Please run 'python tokens.py' to generate new tokens.")
+        else:
+            print(f"Error retrieving account information: {e}")
         sys.exit(1)

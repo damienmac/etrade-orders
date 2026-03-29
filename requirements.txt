@@ -1,1 +1,3 @@
 pyetrade>=1.0.0
+pandas
+openpyxl
