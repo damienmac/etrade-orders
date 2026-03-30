@@ -612,18 +612,29 @@ def write_excel_output(combined: list, output_file: str):
             close_time = datetime.datetime.fromtimestamp(c['epoch'] / 1000)
             if close_time.year > 1980: # Filter out bogus dates
                 close_year = close_time.year
+
+        def parse_to_datetime(date_str):
+            if not date_str:
+                return None
+            try:
+                # Handle potential mixed formats or objects
+                if isinstance(date_str, (datetime.datetime, datetime.date)):
+                    return datetime.datetime(date_str.year, date_str.month, date_str.day)
+                return datetime.datetime.strptime(date_str, "%m/%d/%Y")
+            except Exception:
+                return date_str
         
         row_data = {
             "Symbol": (o or c).get('symbol'),
-            "Open Date": o.get('date') if o else None,
+            "Open Date": parse_to_datetime(o.get('date')) if o else None,
             "Open Action": o.get('action') if o else None,
-            "Open Quantity": o.get('quantity') if o else None,
+            "Open\nQuantity": o.get('quantity') if o else None,
             "Open Price": float(o.get('price')) if o else None,
             "Open Total Out": float(o.get('total_out')) if o else None,
             "Open Total In": float(o.get('total_in')) if o else None,
-            "Close Date": c.get('date') if c else None,
+            "Close Date": parse_to_datetime(c.get('date')) if c else None,
             "Close Action": c.get('action') if c else None,
-            "Close Quantity": c.get('quantity') if c else None,
+            "Close\nQuantity": c.get('quantity') if c else None,
             "Close Price": float(c.get('price')) if c else None,
             "Close Total In": float(c.get('total_in')) if c else None,
             "Close Total Out": float(c.get('total_out')) if c else None,
@@ -635,7 +646,14 @@ def write_excel_output(combined: list, output_file: str):
         }
         rows.append(row_data)
 
-    df = pd.DataFrame(rows)
+    # Convert to a DataFrame
+    df_raw = pd.DataFrame(rows)
+    
+    # Convert date columns to datetime objects so pandas/openpyxl can handle them as dates
+    for col in ["Open Date", "Close Date"]:
+        df_raw[col] = pd.to_datetime(df_raw[col], errors='coerce').dt.date
+
+    df = df_raw
     
     this_year = datetime.datetime.now().year
 
@@ -648,8 +666,11 @@ def write_excel_output(combined: list, output_file: str):
     # Always include 'Current or Open' first (it will be Year 2026 if run in 2026, or trades with no close year)
     current_trades = df[(~df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
     current_puts = df[(df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
-    sheets.append((current_trades, "Trades Current or Open"))
-    sheets.append((current_puts, "Short Puts Current or Open"))
+    
+    if not current_trades.empty:
+        sheets.append((current_trades, "Trades Current or Open"))
+    if not current_puts.empty:
+        sheets.append((current_puts, "Short Puts Current or Open"))
     
     # Then sheets for each previous year
     for year in all_years:
@@ -706,10 +727,86 @@ def write_excel_output(combined: list, output_file: str):
     summary_data = [calculate_summary(data, name) for data, name in sheets]
     dashboard_df = pd.DataFrame(summary_data)
 
+    accounting_format = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
+    date_format = 'mm/dd/yyyy'  # This maps to Excel's Short Date in many locales
+    from openpyxl.styles import Alignment
+
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
         dashboard_df.to_excel(writer, sheet_name='Dashboard', index=False)
+        # Apply formatting to Dashboard
+        worksheet = writer.sheets['Dashboard']
+        for col_idx, col_name in enumerate(dashboard_df.columns, 1):
+            if col_name == "Total P/L":
+                for row_idx in range(2, len(dashboard_df) + 2):
+                    cell = worksheet.cell(row=row_idx, column=col_idx)
+                    cell.number_format = accounting_format
+            
+            # Auto-fit column width
+            max_length = 0
+            column_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            # Header length
+            header_lines = str(col_name).split('\n')
+            max_length = max(max_length, max(len(line) for line in header_lines))
+            if len(header_lines) > 1:
+                worksheet.cell(row=1, column=col_idx).alignment = Alignment(wrapText=True, horizontal='center', vertical='bottom')
+
+            # Data length
+            for row_idx in range(2, len(dashboard_df) + 2):
+                cell_value = worksheet.cell(row=row_idx, column=col_idx).value
+                if cell_value:
+                    val_str = str(cell_value)
+                    if col_name == "Total P/L":
+                        val_str = "$#,###,###.00" # wider typical currency length
+                    max_length = max(max_length, len(val_str))
+            
+            adjusted_width = (max_length + 2)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+
         for data, name in sheets:
-            data.drop(columns=cols_to_drop).to_excel(writer, sheet_name=name, index=False)
+            df_to_write = data.drop(columns=cols_to_drop)
+            df_to_write.to_excel(writer, sheet_name=name, index=False)
+            
+            # Apply formatting to yearly sheets
+            worksheet = writer.sheets[name]
+            for col_idx, col_name in enumerate(df_to_write.columns, 1):
+                # Price and Total columns
+                if "Price" in col_name or "Total" in col_name:
+                    for row_idx in range(2, len(df_to_write) + 2):
+                        cell = worksheet.cell(row=row_idx, column=col_idx)
+                        cell.number_format = accounting_format
+                
+                # Date columns
+                if "Date" in col_name:
+                    for row_idx in range(2, len(df_to_write) + 2):
+                        cell = worksheet.cell(row=row_idx, column=col_idx)
+                        # Setting to 'mm-dd-yy' or 'm/d/yy' often maps to the built-in 
+                        # 'Short Date' format (format ID 14) in Excel.
+                        cell.number_format = 'm/d/yy'
+                
+                # Auto-fit column width
+                max_length = 0
+                column_letter = worksheet.cell(row=1, column=col_idx).column_letter
+                # Header length
+                header_lines = str(col_name).split('\n')
+                max_length = max(max_length, max(len(line) for line in header_lines))
+                if len(header_lines) > 1:
+                    worksheet.cell(row=1, column=col_idx).alignment = Alignment(wrapText=True, horizontal='center', vertical='bottom')
+
+                # Data length
+                for row_idx in range(2, len(df_to_write) + 2):
+                    cell_value = worksheet.cell(row=row_idx, column=col_idx).value
+                    if cell_value:
+                        # For dates and currency, we might want a bit more padding
+                        val_str = str(cell_value)
+                        if "Date" in col_name:
+                            val_str = "MM/DD/YYYY" # typical date length
+                        elif "Price" in col_name or "Total" in col_name:
+                            val_str = "$#,###.00" # typical currency length
+                        
+                        max_length = max(max_length, len(val_str))
+                
+                adjusted_width = (max_length + 2)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
 
     print(f"Excel output saved to {output_file}")
 
