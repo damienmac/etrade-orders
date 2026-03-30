@@ -1,5 +1,7 @@
 import time
 import datetime
+import os
+import re
 from decimal import Decimal
 from typing import Tuple
 import pyetrade
@@ -51,6 +53,7 @@ def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
         marker = order_response.get("marker")
         done = not bool(marker)
         for order in order_response.get("Order", []):
+            order_id = order.get("orderId", "!NO ORDER ID")
             for detail in order.get("OrderDetail", []):
                 status = detail.get("status", "!NO STATUS")
                 if status != "EXECUTED":
@@ -90,6 +93,7 @@ def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
                         "price": price,
                         "total_in": total_in,
                         "total_out": total_out,
+                        "order_id": order_id,
                     }
                     if "Close" in action or "Sell" == action:
                         closes.append(row)
@@ -169,9 +173,13 @@ def add_expired_worthless_orders(opens: list, closes: list):
                     else:
                         continue
                     
-                    # E*Trade timestamps are in milliseconds.
+                    # E*TRADE timestamps are in milliseconds.
                     epoch = int(exp_date.timestamp() * 1000)
                     
+                    # Create a unique-ish ID for synthetic orders to avoid duplicates
+                    # Format: SYNTH-[Symbol]-[Date]-[Action]
+                    synthetic_id = f"SYNTH-{symbol}-{exp_date.strftime('%Y%m%d')}-{close_action}"
+
                     synthetic_close = {
                         "symbol": symbol,
                         "date": exp_date.strftime("%m/%d/%Y"),
@@ -182,6 +190,7 @@ def add_expired_worthless_orders(opens: list, closes: list):
                         "total_in": 0,
                         "total_out": 0,
                         "is_expired": True,
+                        "order_id": synthetic_id,
                     }
                     closes.append(synthetic_close)
 
@@ -306,6 +315,258 @@ def write_output(output_lines: list, output_file: str = None):
             print(line)
 
 
+def load_previous_output(output_file: str) -> list:
+    """
+    Loads previous trades from an Excel or CSV file to enable 'bringing forward' historical data.
+    """
+    if not output_file:
+        return []
+
+    original_output_file = output_file
+    
+    # If the output file is still .csv, we'll check it, but also check for Excel files
+    if output_file.lower().endswith('.csv'):
+        xlsx_file = output_file[:-4] + '.xlsx'
+    else:
+        xlsx_file = output_file
+
+    directory = os.path.dirname(xlsx_file) or '.'
+    base_name = os.path.basename(xlsx_file)
+    # Remove extension and date pattern if exists to find the prefix
+    # We look for files starting with 'orders_output'
+    prefix = base_name.split('.')[0]
+    if '_' in prefix:
+        prefix = prefix.split('_')[0]
+
+    # Find the most recent Excel file if it doesn't exist exactly as named (e.g. dated files)
+    if not os.path.exists(xlsx_file):
+        extensions = ['.xlsx', '.xlsm']
+        files = [f for f in os.listdir(directory) if f.startswith(prefix) and any(f.endswith(ext) for ext in extensions) and not f.startswith('~$')]
+        if files:
+            # Sort by modification time to get the latest
+            files.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True)
+            xlsx_file = os.path.join(directory, files[0])
+            print(f"Loading previous trades from: {xlsx_file}")
+        else:
+            xlsx_file = None
+    else:
+        print(f"Loading previous trades from exact file: {xlsx_file}")
+
+    all_history = []
+
+    if xlsx_file and os.path.exists(xlsx_file):
+        try:
+            xls = pd.ExcelFile(xlsx_file)
+            for sheet_name in xls.sheet_names:
+                if sheet_name == 'Dashboard':
+                    continue
+                
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                # Filter out completely empty rows
+                df = df.dropna(how='all')
+                if df.empty:
+                    continue
+
+                # Standardize columns (some might be missing in older versions)
+                required_cols = [
+                    'Symbol', 'Open Date', 'Open Action', 'Open Quantity', 'Open Price', 
+                    'Open Total Out', 'Open Total In', 'Close Date', 'Close Action', 
+                    'Close Quantity', 'Close Price', 'Close Total In', 'Close Total Out'
+                ]
+                
+                # Check for legacy column names in single-sheet formats
+                if 'Symbol' not in df.columns:
+                    # Try to find a column that looks like Symbol
+                    for col in df.columns:
+                        if 'symbol' in str(col).lower():
+                            df.rename(columns={col: 'Symbol'}, inplace=True)
+                            break
+                
+                if 'Symbol' not in df.columns:
+                    continue
+
+                for col in required_cols:
+                    if col not in df.columns:
+                        df[col] = None
+                
+                # Map back to internal 'combined' structure
+                for _, row in df.iterrows():
+                    # Skip if symbol is missing (likely an empty or header row)
+                    if pd.isna(row['Symbol']):
+                        continue
+
+                    # Reconstruct 'open' part
+                    opening = None
+                    if pd.notna(row['Open Date']):
+                        opening = {
+                            "symbol": str(row['Symbol']),
+                            "date": str(row['Open Date']),
+                            "action": str(row['Open Action']),
+                            "quantity": int(row['Open Quantity']) if pd.notna(row['Open Quantity']) else 0,
+                            "price": Decimal(str(row['Open Price'])) if pd.notna(row['Open Price']) else None,
+                            "total_in": Decimal(str(row['Open Total In'])) if pd.notna(row['Open Total In']) else 0,
+                            "total_out": Decimal(str(row['Open Total Out'])) if pd.notna(row['Open Total Out']) else 0,
+                            "order_id": row.get('Open Order ID') if pd.notna(row.get('Open Order ID')) else None,
+                        }
+                        # Try to reconstruct epoch from date
+                        try:
+                            date_str = str(row['Open Date'])
+                            if ' ' in date_str: date_str = date_str.split(' ')[0] # handle datetime objects
+                            dt = datetime.datetime.strptime(date_str, "%m/%d/%Y")
+                            opening["epoch"] = int(dt.timestamp() * 1000)
+                        except:
+                            opening["epoch"] = None
+                    
+                    # Reconstruct 'close' part
+                    closing = None
+                    if pd.notna(row['Close Date']):
+                        closing = {
+                            "symbol": str(row['Symbol']),
+                            "date": str(row['Close Date']),
+                            "action": str(row['Close Action']),
+                            "quantity": int(row['Close Quantity']) if pd.notna(row['Close Quantity']) else 0,
+                            "price": Decimal(str(row['Close Price'])) if pd.notna(row['Close Price']) else None,
+                            "total_in": Decimal(str(row['Close Total In'])) if pd.notna(row['Close Total In']) else 0,
+                            "total_out": Decimal(str(row['Close Total Out'])) if pd.notna(row['Close Total Out']) else 0,
+                            "is_expired": row.get('EXPIRED') == "EXPIRED",
+                            "order_id": row.get('Close Order ID') if pd.notna(row.get('Close Order ID')) else None,
+                        }
+                        # Try to reconstruct epoch from date
+                        try:
+                            date_str = str(row['Close Date'])
+                            if ' ' in date_str: date_str = date_str.split(' ')[0]
+                            dt = datetime.datetime.strptime(date_str, "%m/%d/%Y")
+                            closing["epoch"] = int(dt.timestamp() * 1000)
+                        except:
+                            closing["epoch"] = None
+
+                    trade = {
+                        "symbol": str(row['Symbol']),
+                        "epoch": closing.get("epoch") if (closing and closing.get("epoch") is not None) else (opening.get("epoch") if (opening and opening.get("epoch") is not None) else 0),
+                        "open": opening,
+                        "close": closing
+                    }
+                    all_history.append(trade)
+        except Exception as e:
+            print(f"Warning: Could not load previous Excel output file: {e}")
+
+    # ALSO load from legacy CSV if it exists to ensure we don't miss anything
+    if os.path.exists('orders_output.csv'):
+        try:
+            print(f"Merging legacy trades from CSV: orders_output.csv")
+            df = pd.read_csv('orders_output.csv')
+            # Filter out completely empty rows
+            df = df.dropna(how='all')
+            
+            # Map back to internal 'combined' structure
+            for _, row in df.iterrows():
+                # Skip if symbol is missing
+                if pd.isna(row['Symbol']):
+                    continue
+                # Reconstruct 'open' part
+                opening = None
+                if pd.notna(row['Open Date']):
+                    opening = {
+                        "symbol": str(row['Symbol']),
+                        "date": str(row['Open Date']),
+                        "action": str(row['Open Action']),
+                        "quantity": int(row['Open Quantity']) if pd.notna(row['Open Quantity']) else 0,
+                        "price": Decimal(str(row['Open Price'])) if pd.notna(row['Open Price']) else None,
+                        "total_in": Decimal(str(row['Open Total In'])) if pd.notna(row['Open Total In']) else 0,
+                        "total_out": Decimal(str(row['Open Total Out'])) if pd.notna(row['Open Total Out']) else 0,
+                    }
+                    try:
+                        dt = datetime.datetime.strptime(str(row['Open Date']), "%m/%d/%Y")
+                        opening["epoch"] = int(dt.timestamp() * 1000)
+                    except:
+                        opening["epoch"] = None
+                
+                # Reconstruct 'close' part
+                closing = None
+                if pd.notna(row['Close Date']):
+                    closing = {
+                        "symbol": str(row['Symbol']),
+                        "date": str(row['Close Date']),
+                        "action": str(row['Close Action']),
+                        "quantity": int(row['Close Quantity']) if pd.notna(row['Close Quantity']) else 0,
+                        "price": Decimal(str(row['Close Price'])) if pd.notna(row['Close Price']) else None,
+                        "total_in": Decimal(str(row['Close Total In'])) if pd.notna(row['Close Total In']) else 0,
+                        "total_out": Decimal(str(row['Close Total Out'])) if pd.notna(row['Close Total Out']) else 0,
+                    }
+                    try:
+                        dt = datetime.datetime.strptime(str(row['Close Date']), "%m/%d/%Y")
+                        closing["epoch"] = int(dt.timestamp() * 1000)
+                    except:
+                        closing["epoch"] = None
+
+                trade = {
+                    "symbol": str(row['Symbol']),
+                    "epoch": closing.get("epoch") if (closing and closing.get("epoch") is not None) else (opening.get("epoch") if (opening and opening.get("epoch") is not None) else 0),
+                    "open": opening,
+                    "close": closing
+                }
+                all_history.append(trade)
+        except Exception as e:
+            print(f"Warning: Could not load legacy CSV file: {e}")
+
+    return all_history
+
+
+def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
+    """
+    Merges old and new trades using a hybrid ID and fingerprint approach.
+    """
+    def get_fingerprint(trade_leg):
+        if not trade_leg:
+            return None
+        # Fingerprint: Symbol|Date|Action|Quantity|Price
+        return f"{trade_leg['symbol']}|{trade_leg['date']}|{trade_leg['action']}|{trade_leg['quantity']}|{trade_leg['price']}"
+
+    # We want to keep track of legs (opens and closes) independently to ensure full deduplication
+    seen_ids = set()
+    seen_fingerprints = set()
+    
+    unique_trades = []
+    
+    # Process new trades first as they are "fresher" and have Order IDs
+    for trade in new_trades + old_trades:
+        o = trade['open']
+        c = trade['close']
+        
+        # Determine if this trade is "new" to our list
+        # A trade is considered seen if BOTH its legs (if they exist) have been seen
+        legs_seen = 0
+        legs_count = 0
+        
+        if o:
+            legs_count += 1
+            o_id = o.get('order_id')
+            o_fp = get_fingerprint(o)
+            if (o_id and o_id in seen_ids) or (o_fp in seen_fingerprints):
+                legs_seen += 1
+        
+        if c:
+            legs_count += 1
+            c_id = c.get('order_id')
+            c_fp = get_fingerprint(c)
+            if (c_id and c_id in seen_ids) or (c_fp in seen_fingerprints):
+                legs_seen += 1
+                
+        if legs_seen < legs_count:
+            # At least one leg is new, so we add this trade
+            unique_trades.append(trade)
+            
+            # Mark legs as seen
+            if o:
+                if o.get('order_id'): seen_ids.add(o.get('order_id'))
+                seen_fingerprints.add(get_fingerprint(o))
+            if c:
+                if c.get('order_id'): seen_ids.add(c.get('order_id'))
+                seen_fingerprints.add(get_fingerprint(c))
+                
+    return unique_trades
+
+
 def write_excel_output(combined: list, output_file: str):
     """
     Writes the matched trades to an Excel file with data divided across multiple sheets.
@@ -317,9 +578,15 @@ def write_excel_output(combined: list, output_file: str):
         print("No output file specified for Excel output.")
         return
 
-    # If the output file is still .csv, change it to .xlsx
+    # If the output file is still .csv, change it to .xlsx and add current date
     if output_file.lower().endswith('.csv'):
-        output_file = output_file[:-4] + '.xlsx'
+        output_file = output_file[:-4]
+    elif output_file.lower().endswith('.xlsx'):
+        output_file = output_file[:-5]
+    
+    # Add today's date to filename
+    datestr = datetime.datetime.now().strftime("%Y-%m-%d")
+    output_file = f"{output_file}_{datestr}.xlsx"
 
     rows = []
     for entry in sorted(combined, key=lambda x: (x['symbol'], x['epoch'])):
@@ -340,10 +607,11 @@ def write_excel_output(combined: list, output_file: str):
 
         # Determine closing year
         close_year = None
-        if c:
+        if c and c.get('epoch') is not None:
             # executed_time is in milliseconds
             close_time = datetime.datetime.fromtimestamp(c['epoch'] / 1000)
-            close_year = close_time.year
+            if close_time.year > 1980: # Filter out bogus dates
+                close_year = close_time.year
         
         row_data = {
             "Symbol": (o or c).get('symbol'),
@@ -360,6 +628,8 @@ def write_excel_output(combined: list, output_file: str):
             "Close Total In": float(c.get('total_in')) if c else None,
             "Close Total Out": float(c.get('total_out')) if c else None,
             "EXPIRED": "EXPIRED" if c and c.get('is_expired') else "",
+            "Open Order ID": o.get('order_id') if o else None,
+            "Close Order ID": c.get('order_id') if c else None,
             "_is_sold_put": is_sold_put,
             "_close_year": close_year
         }
@@ -368,36 +638,44 @@ def write_excel_output(combined: list, output_file: str):
     df = pd.DataFrame(rows)
     
     this_year = datetime.datetime.now().year
-    year_minus_1 = this_year - 1
-    year_minus_2 = this_year - 2
 
-    # Partitioning logic
-    # sheet1: not sold puts, closed in year_minus_2
-    sheet1 = df[(~df['_is_sold_put']) & (df['_close_year'] == year_minus_2)]
+    # Partitioning logic - Dynamic years
+    # We want sheets for every year present in the data, plus a 'Current or Open' sheet
+    all_years = sorted([y for y in df['_close_year'].unique() if pd.notna(y)], reverse=True)
     
-    # sheet2: sold puts, closed in year_minus_2
-    sheet2 = df[(df['_is_sold_put']) & (df['_close_year'] == year_minus_2)]
+    sheets = []
     
-    # sheet3: not sold puts, closed in year_minus_1
-    sheet3 = df[(~df['_is_sold_put']) & (df['_close_year'] == year_minus_1)]
+    # Always include 'Current or Open' first (it will be Year 2026 if run in 2026, or trades with no close year)
+    current_trades = df[(~df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
+    current_puts = df[(df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
+    sheets.append((current_trades, "Trades Current or Open"))
+    sheets.append((current_puts, "Short Puts Current or Open"))
     
-    # sheet4: sold puts, closed in year_minus_1
-    sheet4 = df[(df['_is_sold_put']) & (df['_close_year'] == year_minus_1)]
-    
-    # sheet5: not sold puts, closed this year OR not closed
-    sheet5 = df[(~df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
-    
-    # sheet6: sold puts, closed this year OR not closed
-    sheet6 = df[(df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
+    # Then sheets for each previous year
+    for year in all_years:
+        if year == this_year:
+            continue
+        year_trades = df[(~df['_is_sold_put']) & (df['_close_year'] == year)]
+        year_puts = df[(df['_is_sold_put']) & (df['_close_year'] == year)]
+        if not year_trades.empty:
+            sheets.append((year_trades, f"Trades {int(year)}"))
+        if not year_puts.empty:
+            sheets.append((year_puts, f"Short Puts {int(year)}"))
 
     # Remove helper columns before writing
     cols_to_drop = ['_is_sold_put', '_close_year']
     
     # Dashboard calculations
     def calculate_summary(df_partition, name):
+        if df_partition.empty:
+            return {
+                "Category": name,
+                "Total Trades": 0,
+                "Closed Trades": 0,
+                "Total P/L": 0.0,
+                "Win Rate (Closed)": "N/A"
+            }
         # P/L = (Open Total In + Open Total Out) + (Close Total In + Close Total Out)
-        # Note: Open Total Out is negative for buys, Close Total In is positive for sells, etc.
-        # Summing them all up gives the net P/L.
         pl = (df_partition['Open Total Out'].fillna(0) + 
               df_partition['Open Total In'].fillna(0) + 
               df_partition['Close Total In'].fillna(0) + 
@@ -405,7 +683,7 @@ def write_excel_output(combined: list, output_file: str):
         
         count = len(df_partition)
         
-        # Win rate: only for closed trades (where Close Date is not null)
+        # Win rate: only for closed trades
         closed_trades = df_partition[df_partition['Close Date'].notna()]
         if len(closed_trades) > 0:
             trade_pls = (closed_trades['Open Total Out'].fillna(0) + 
@@ -425,24 +703,13 @@ def write_excel_output(combined: list, output_file: str):
             "Win Rate (Closed)": win_rate
         }
 
-    summary_data = [
-        calculate_summary(sheet1, f"Trades {year_minus_2}"),
-        calculate_summary(sheet2, f"Short Puts {year_minus_2}"),
-        calculate_summary(sheet3, f"Trades {year_minus_1}"),
-        calculate_summary(sheet4, f"Short Puts {year_minus_1}"),
-        calculate_summary(sheet5, "Trades Current or Open"),
-        calculate_summary(sheet6, "Short Puts Current or Open"),
-    ]
+    summary_data = [calculate_summary(data, name) for data, name in sheets]
     dashboard_df = pd.DataFrame(summary_data)
 
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
         dashboard_df.to_excel(writer, sheet_name='Dashboard', index=False)
-        sheet1.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Trades {year_minus_2}', index=False)
-        sheet2.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Short Puts {year_minus_2}', index=False)
-        sheet3.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Trades {year_minus_1}', index=False)
-        sheet4.drop(columns=cols_to_drop).to_excel(writer, sheet_name=f'Short Puts {year_minus_1}', index=False)
-        sheet5.drop(columns=cols_to_drop).to_excel(writer, sheet_name='Trades Current or Open', index=False)
-        sheet6.drop(columns=cols_to_drop).to_excel(writer, sheet_name='Short Puts Current or Open', index=False)
+        for data, name in sheets:
+            data.drop(columns=cols_to_drop).to_excel(writer, sheet_name=name, index=False)
 
     print(f"Excel output saved to {output_file}")
 
@@ -484,6 +751,12 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
 
     add_expired_worthless_orders(opens, closes)
 
-    combined = match_trades(opens, closes)
+    new_trades = match_trades(opens, closes)
+    
+    # Bring forward historical trades from previous output
+    old_trades = load_previous_output(output_file)
+    
+    # Merge and deduplicate
+    combined = merge_and_deduplicate(old_trades, new_trades)
 
     write_excel_output(combined, output_file)

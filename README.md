@@ -1,82 +1,86 @@
-# E*TRADE API Order Capture Tool
+# E*TRADE API Order & Trade Performance Tool
 
-This tool allows you to capture your E*TRADE orders using the E*TRADE API. It retrieves your order history and outputs it in a structured format.
+This tool automates the process of capturing E*TRADE order history and calculating trade performance. It transforms raw order data into a multi-sheet Excel report with matched opening and closing trades, a performance dashboard, and automated handling of expired options.
+
+## Key Features
+
+- **Automated Trade Matching:** Automatically pairs opening and closing orders for options and stocks.
+- **Performance Dashboard:** A front-page summary of P/L, win rates, and trade counts by year and strategy.
+- **Dynamic Yearly Sheets:** Automatically partitions trades into `Trades [Year]` and `Short Puts [Year]` sheets based on the closing date.
+- **"Bring Forward" History:** Automatically merges new data with previous Excel (`.xlsx`, `.xlsm`) or CSV reports to build a permanent history beyond E*TRADE's 2-year API limit.
+- **Worthless Expiration Handling:** Detects expired options and creates synthetic $0 closing orders to accurately reflect total P/L.
+- **Multi-Sheet Excel Output:** Clearly organized reports with "Current or Open" sheets for active and recent trades.
 
 ## Prerequisites
 
 - An E*TRADE account
 - E*TRADE API keys (consumer key and consumer secret)
 - Python 3.6 or higher
-- Required Python packages (install via `pip install -r requirements.txt`)
+- Required Python packages: `pandas`, `openpyxl`, `pyetrade` (install via `pip install -r requirements.txt`)
 
 ## Setup Instructions
 
 ### 1. Configure API Credentials
 
-Before using this tool, you need to set up your `etrade.properties` file with your E*TRADE API credentials:
+Before using this tool, you need to set up your `etrade.properties` file:
 
-1. Copy the template file to create your own properties file:
+1. Copy the template file:
    ```bash
    cp etrade.properties.template etrade.properties
    ```
-2. Open `etrade.properties` in a text editor.
-3. Replace the placeholder values with your actual API credentials:
+2. Open `etrade.properties` and enter your credentials:
    ```
    consumer_key = "your_consumer_key_here"
    consumer_secret = "your_consumer_secret_here"
-   ```
-4. Configure your account ID:
-   ```
    account_id = "your_account_id_here"
    ```
-5. (Optional) Configure output to a file:
+3. (Optional) Configure the output filename:
    ```
-   output_file = "orders_output.csv"
+   output_file = "orders_output.xlsx"
    ```
-6. Save the file.
 
 ### 2. Generate Authentication Tokens
 
-The E*TRADE API requires OAuth authentication tokens. To generate these tokens:
+The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 
 1. Run the tokens script:
-   ```
+   ```bash
    python tokens.py
    ```
-2. The script will display a URL. Copy this URL and paste it into your web browser.
-3. Log in to your E*TRADE account if prompted.
-4. Authorize the application when asked.
-5. You will receive a verification code. Copy this code.
-6. Return to the terminal and paste the verification code when prompted.
-7. The script will generate the authentication tokens and save them to `etrade_tokens.py`.
+2. Follow the URL in the terminal, authorize the app in your browser, and enter the verification code back into the prompt.
+3. This creates `etrade_tokens.py` which is used automatically by the main script.
 
-### 3. Capture Orders
-
-After generating the authentication tokens, you can now capture your orders:
+### 3. Capture and Process Orders
 
 1. Run the main script:
-   ```
+   ```bash
    python main.py
    ```
-2. The script will use the tokens from `etrade_tokens.py` to authenticate with the E*TRADE API.
-3. It will retrieve your order history and output it in a structured format.
+2. The script will:
+   - Load previous history from the most recent `orders_output_YYYY-MM-DD.xlsx` or `orders_output.csv`.
+   - Fetch new executed orders from the last 2 years.
+   - Match opens and closes, deduplicating using Order IDs and trade fingerprints.
+   - Generate a new dated Excel file (e.g., `orders_output_2026-03-29.xlsx`).
 
-## Workflow Summary
+## Understanding the Output
 
-1. Edit `etrade.properties` with your API credentials
-2. Run `tokens.py` to generate authentication tokens (saved to `etrade_tokens.py`)
-3. Run `main.py` to capture your orders
+### Excel Sheet Structure
+- **Dashboard:** High-level summary of performance metrics (Total P/L, Win Rate, Trade Count) for every year and category.
+- **Trades [Year]:** All stock and option trades (except Short Puts) closed in that specific year.
+- **Short Puts [Year]:** Specifically tracks "Sell Open" put options for that year.
+- **Current or Open:** Contains all currently open positions and trades closed in the current calendar year.
+
+### Column Definitions
+- **Total In / Total Out:** Raw cash flow for the leg.
+- **EXPIRED:** Marked "EXPIRED" for synthetic $0 closing records created for worthless options.
+- **Order ID Columns:** Used for robust deduplication when merging historical files.
 
 ## Troubleshooting
 
-- If you see a message "Warning: etrade_tokens.py not found", it means you need to run `tokens.py` first.
-- Authentication tokens expire after some time. If you encounter authentication errors, regenerate the tokens by running `tokens.py` again.
-- Make sure your API credentials in `etrade.properties` are correct and not expired.
-- You can run `python test_tokens_workflow.py` to verify that your token workflow is set up correctly.
+- **401 Unauthorized Error:** Your tokens have expired. Run `python tokens.py` again.
+- **"Bringing Forward" Data:** If you have an old manual spreadsheet, name it `orders_output.csv` in the root directory. The script will automatically migrate its data on the next run.
+- **Verification:** Run `python test_tokens_workflow.py` to check your API connection and token status.
 
-## Notes
+## Customization
 
-- The authentication tokens are saved to `etrade_tokens.py` and will be automatically used by `main.py`.
-- You only need to regenerate tokens when they expire (typically after 24 hours).
-- By default, the tool retrieves orders from January 1st of the current year to today. If you need to modify this date range, you can edit the date calculation in `main.py`.
-- Output is displayed in CSV format, either to the console or to a file if `output_file` is configured in `etrade.properties`.
+By default, the tool looks back 2 years for new orders. To change this, you can modify the `two_years_ago` calculation at the top of `orders.py`.
