@@ -71,17 +71,20 @@ def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
                     action = action_mapping.get(action, "!NO ACTION")
                     quantity = int(instrument.get("filledQuantity", "!NO QUANTITY"))
                     price = Decimal(str(instrument.get("averageExecutionPrice", "0.00")))
-                    if "Buy Open" == action:
+                    if action in {"Buy Open", "Buy Close"}:
                         total_in = 0
                         total_out = (price * 100) * quantity * -1
-                    elif "Buy" == action:
+                    elif action == "Buy":
                         total_in = 0
                         total_out = price * quantity * -1
-                    elif "Sell" == action:
+                    elif action in {"Sell Open", "Sell Close"}:
+                        total_in = (price * 100) * quantity
+                        total_out = 0
+                    elif action == "Sell":
                         total_in = price * quantity
                         total_out = 0
-                    else:  # Sell Close
-                        total_in = (price * 100) * quantity
+                    else:
+                        total_in = 0
                         total_out = 0
                     # print(f"{symbol},  {formatted_time}, {action},  {quantity},  {price}")
                     row = {
@@ -965,6 +968,7 @@ def write_excel_output(combined: list, output_file: str):
     output_file = f"{output_file}_{datestr}.xlsx"
 
     rows = []
+    validation_rows = []
     assignment_links = link_short_put_assignments(combined)
     assignment_linked_buy_indices = {
         info.get("buy_entry_idx")
@@ -1051,6 +1055,67 @@ def write_excel_output(combined: list, output_file: str):
             "_close_year": close_year
         }
 
+    def build_validation_issues(df_all: pd.DataFrame):
+        if df_all.empty:
+            return pd.DataFrame(columns=list(df_all.columns) + ["ValidationIssueType", "ValidationReason"])
+
+        issues = []
+        option_rows = df_all[df_all["Symbol"].astype(str).str.contains(" Call| Put", na=False)].copy()
+        option_rows = option_rows[option_rows["Assignment Status"].astype(str) != "ASSIGNED_LINKED"]
+
+        if option_rows.empty:
+            return pd.DataFrame(columns=list(df_all.columns) + ["ValidationIssueType", "ValidationReason"])
+
+        for symbol, group in option_rows.groupby("Symbol", dropna=False):
+            open_qty_total = group[
+                group["Open Action"].isin(["Buy Open", "Sell Open"])
+            ]["Open\nQuantity"].fillna(0).sum()
+            close_qty_total = group[
+                group["Close Action"].isin(["Buy Close", "Sell Close"])
+            ]["Close\nQuantity"].fillna(0).sum()
+
+            unmatched_close_qty = int(max(0, close_qty_total - open_qty_total))
+            if unmatched_close_qty <= 0:
+                continue
+
+            close_only_rows = group[
+                group["Close Action"].isin(["Buy Close", "Sell Close"])
+                & group["Open Action"].isna()
+                & group["Close\nQuantity"].fillna(0).gt(0)
+            ].copy()
+
+            if close_only_rows.empty:
+                continue
+
+            close_only_rows = close_only_rows.sort_values(by=["Close Date", "Close\nQuantity"], ascending=[True, False])
+            expiration_dt = parse_expiration_date(str(symbol))
+
+            for _, candidate in close_only_rows.iterrows():
+                if unmatched_close_qty <= 0:
+                    break
+
+                candidate_close_date = candidate.get("Close Date")
+                if pd.isna(candidate_close_date):
+                    continue
+
+                if expiration_dt is None or expiration_dt.date() >= datetime.date.today():
+                    continue
+
+                qty = int(candidate.get("Close\nQuantity") or 0)
+                if qty <= 0:
+                    continue
+
+                issue_row = candidate.to_dict()
+                issue_row["ValidationIssueType"] = "historical_orphan_close"
+                issue_row["ValidationReason"] = "Close exists without enough matching open quantity; contract expiration is in the past."
+                issues.append(issue_row)
+                unmatched_close_qty -= qty
+
+        issue_columns = list(df_all.columns) + ["ValidationIssueType", "ValidationReason"]
+        if not issues:
+            return pd.DataFrame(columns=issue_columns)
+        return pd.DataFrame(issues, columns=issue_columns)
+
     for entry_idx, entry in sorted(entries_with_indices, key=lambda item: (item[1]['symbol'], item[1]['epoch'])):
         o = entry['open']
         c = entry['close']
@@ -1097,6 +1162,7 @@ def write_excel_output(combined: list, output_file: str):
             assignment_status=assignment_status
         )
         rows.append(row_data)
+        validation_rows.append(row_data.copy())
 
         if assignment_info and assignment_info.get("status") == "ASSIGNED_LINKED":
             buy_entry_idx = assignment_info.get("buy_entry_idx")
@@ -1124,6 +1190,7 @@ def write_excel_output(combined: list, output_file: str):
                     assignment_status="ASSIGNED_LINKED"
                 )
                 rows.append(assignment_buy_row)
+                validation_rows.append(assignment_buy_row.copy())
 
             for sell_leg in assignment_info.get("sell_legs", []):
                 if not sell_leg:
@@ -1139,13 +1206,18 @@ def write_excel_output(combined: list, output_file: str):
                     assignment_status="ASSIGNED_LINKED"
                 )
                 rows.append(assignment_sell_row)
+                validation_rows.append(assignment_sell_row.copy())
 
     # Convert to a DataFrame
     df_raw = pd.DataFrame(rows)
+    validation_df_raw = pd.DataFrame(validation_rows)
     
     # Convert date columns to datetime objects so pandas/openpyxl can handle them as dates
     for col in ["Open Date", "Close Date"]:
         df_raw[col] = pd.to_datetime(df_raw[col], errors='coerce').dt.date
+        validation_df_raw[col] = pd.to_datetime(validation_df_raw[col], errors='coerce').dt.date
+
+    validation_issues_df = build_validation_issues(validation_df_raw)
 
     df = df_raw
     
@@ -1221,6 +1293,57 @@ def write_excel_output(combined: list, output_file: str):
     summary_data = [calculate_summary(data, name) for data, name in sheets]
     dashboard_df = pd.DataFrame(summary_data)
 
+    if validation_issues_df.empty:
+        validation_summary_df = pd.DataFrame([
+            {
+                "Validation Issue Type": "None",
+                "Rows": 0,
+                "Distinct Symbols": 0,
+                "Total Close Quantity": 0,
+                "Net Cash Impact": 0.0,
+                "Gross Cash Moved": 0.0,
+            }
+        ])
+    else:
+        validation_issues_df = validation_issues_df.copy()
+        for cash_col in ["Open Total In", "Open Total Out", "Close Total In", "Close Total Out"]:
+            validation_issues_df[cash_col] = pd.to_numeric(validation_issues_df[cash_col], errors="coerce").fillna(0.0)
+        validation_issues_df["_net_cash_impact"] = (
+            validation_issues_df["Open Total In"]
+            + validation_issues_df["Open Total Out"]
+            + validation_issues_df["Close Total In"]
+            + validation_issues_df["Close Total Out"]
+        )
+        validation_issues_df["_gross_cash_moved"] = (
+            validation_issues_df["Open Total In"].abs()
+            + validation_issues_df["Open Total Out"].abs()
+            + validation_issues_df["Close Total In"].abs()
+            + validation_issues_df["Close Total Out"].abs()
+        )
+
+        validation_summary_df = (
+            validation_issues_df.groupby("ValidationIssueType", dropna=False)
+            .agg({
+                "Symbol": "nunique",
+                "Close\nQuantity": "sum",
+                "_net_cash_impact": "sum",
+                "_gross_cash_moved": "sum",
+            })
+            .reset_index()
+            .rename(columns={
+                "ValidationIssueType": "Validation Issue Type",
+                "Symbol": "Distinct Symbols",
+                "Close\nQuantity": "Total Close Quantity",
+                "_net_cash_impact": "Net Cash Impact",
+                "_gross_cash_moved": "Gross Cash Moved",
+            })
+        )
+        issue_counts = validation_issues_df["ValidationIssueType"].value_counts(dropna=False).rename_axis(
+            "Validation Issue Type"
+        ).reset_index(name="Rows")
+        validation_summary_df = issue_counts.merge(validation_summary_df, on="Validation Issue Type", how="left")
+        validation_summary_df = validation_summary_df.sort_values(by=["Rows", "Total Close Quantity"], ascending=[False, False])
+
     accounting_format = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
     date_format = 'mm/dd/yyyy'  # This maps to Excel's Short Date in many locales
     from openpyxl.styles import Alignment
@@ -1255,6 +1378,16 @@ def write_excel_output(combined: list, output_file: str):
             
             adjusted_width = (max_length + 2)
             worksheet.column_dimensions[column_letter].width = adjusted_width
+
+        validation_count = len(validation_issues_df)
+        pointer_row = len(dashboard_df) + 3
+        worksheet.cell(row=pointer_row, column=1, value="Validation Issues")
+        worksheet.cell(row=pointer_row, column=2, value=validation_count)
+        worksheet.cell(
+            row=pointer_row,
+            column=3,
+            value="See 'Validation Issues' and 'Validation Summary' tabs",
+        )
 
         for data, name in sheets:
             df_to_write = data.drop(columns=cols_to_drop)
@@ -1301,6 +1434,56 @@ def write_excel_output(combined: list, output_file: str):
                 
                 adjusted_width = (max_length + 2)
                 worksheet.column_dimensions[column_letter].width = adjusted_width
+
+        validation_to_write = validation_issues_df.drop(columns=cols_to_drop, errors='ignore')
+        validation_to_write.to_excel(writer, sheet_name="Validation Issues", index=False)
+
+        validation_sheet = writer.sheets["Validation Issues"]
+        for col_idx, col_name in enumerate(validation_to_write.columns, 1):
+            if "Price" in col_name or "Total" in col_name:
+                for row_idx in range(2, len(validation_to_write) + 2):
+                    cell = validation_sheet.cell(row=row_idx, column=col_idx)
+                    cell.number_format = accounting_format
+
+            if "Date" in col_name:
+                for row_idx in range(2, len(validation_to_write) + 2):
+                    cell = validation_sheet.cell(row=row_idx, column=col_idx)
+                    cell.number_format = 'm/d/yy'
+
+            max_length = 0
+            column_letter = validation_sheet.cell(row=1, column=col_idx).column_letter
+            header_lines = str(col_name).split('\n')
+            max_length = max(max_length, max(len(line) for line in header_lines))
+            if len(header_lines) > 1:
+                validation_sheet.cell(row=1, column=col_idx).alignment = Alignment(wrapText=True, horizontal='center', vertical='bottom')
+
+            for row_idx in range(2, len(validation_to_write) + 2):
+                cell_value = validation_sheet.cell(row=row_idx, column=col_idx).value
+                if cell_value:
+                    val_str = str(cell_value)
+                    if "Date" in col_name:
+                        val_str = "MM/DD/YYYY"
+                    elif "Price" in col_name or "Total" in col_name:
+                        val_str = "$#,###.00"
+                    max_length = max(max_length, len(val_str))
+
+            validation_sheet.column_dimensions[column_letter].width = (max_length + 2)
+
+        validation_summary_df.to_excel(writer, sheet_name="Validation Summary", index=False)
+        validation_summary_sheet = writer.sheets["Validation Summary"]
+        for col_idx, col_name in enumerate(validation_summary_df.columns, 1):
+            if col_name in {"Net Cash Impact", "Gross Cash Moved"}:
+                for row_idx in range(2, len(validation_summary_df) + 2):
+                    cell = validation_summary_sheet.cell(row=row_idx, column=col_idx)
+                    cell.number_format = accounting_format
+            max_length = len(str(col_name))
+            for row_idx in range(2, len(validation_summary_df) + 2):
+                cell_value = validation_summary_sheet.cell(row=row_idx, column=col_idx).value
+                if cell_value is not None:
+                    max_length = max(max_length, len(str(cell_value)))
+            validation_summary_sheet.column_dimensions[
+                validation_summary_sheet.cell(row=1, column=col_idx).column_letter
+            ].width = max_length + 2
 
     print(f"Excel output saved to {output_file}")
 

@@ -1,6 +1,6 @@
 # E*TRADE API Order & Trade Performance Tool
 
-This tool automates the process of capturing E*TRADE order history and calculating trade performance. It transforms raw order data into a multi-sheet Excel report with matched opening and closing trades, a performance dashboard, and automated handling of expired options.
+This tool automates the process of capturing E*TRADE order history and calculating trade performance. It transforms raw order data into a multi-sheet Excel report with matched opening and closing trades, a performance dashboard, automated handling of expired options, and validation views for orphaned historical closes.
 
 ## Key Features
 
@@ -10,6 +10,8 @@ This tool automates the process of capturing E*TRADE order history and calculati
 - **"Bring Forward" History:** Automatically merges new data with previous Excel (`.xlsx`, `.xlsm`) or CSV reports to build a permanent history beyond E*TRADE's 2-year API limit.
 - **Worthless Expiration Handling:** Detects expired options and creates synthetic $0 closing orders to accurately reflect total P/L.
 - **Multi-Sheet Excel Output:** Clearly organized reports with "Current or Open" sheets for active and recent trades.
+- **Validation Issues Detection:** Flags expired historical close legs that do not have enough matching open quantity in the available history (while avoiding false positives from assignment-linked/split-quantity flows).
+- **Validation Summary & Dashboard Pointer:** Adds a `Validation Summary` tab and a `Dashboard` pointer row showing validation issue count for quick review.
 
 ## Prerequisites
 
@@ -72,9 +74,12 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 
 ### Excel Sheet Structure
 - **Dashboard:** High-level summary of performance metrics (Total P/L, Win Rate, Trade Count) for every year and category.
+- **Dashboard Validation Pointer:** Includes a quick row showing total validation issue count and where to review details.
 - **Trades [Year]:** All stock and option trades (except Short Puts) closed in that specific year.
 - **Short Puts [Year]:** Specifically tracks "Sell Open" put options for that year.
 - **Current or Open:** Contains all currently open positions and trades closed in the current calendar year.
+- **Validation Issues:** Lists flagged rows using the same trade row schema as other tabs, with trailing metadata columns (`ValidationIssueType`, `ValidationReason`).
+- **Validation Summary:** Aggregates validation results by issue type with counts, distinct symbols, total close quantity, `Net Cash Impact`, and `Gross Cash Moved`.
 
 ### Column Definitions
 - **Total In / Total Out:** Raw cash flow for the leg.

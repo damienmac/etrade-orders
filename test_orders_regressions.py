@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pandas as pd
 
-from orders import link_short_put_assignments, merge_and_deduplicate, parse_mmddyyyy, write_excel_output
+from orders import fetch_executed_orders, link_short_put_assignments, merge_and_deduplicate, parse_mmddyyyy, write_excel_output
 
 
 class OrdersRegressionsTest(unittest.TestCase):
@@ -318,6 +318,170 @@ class OrdersRegressionsTest(unittest.TestCase):
                         & short_puts_current["Symbol"].astype(str).str.contains("MOONLAKE|MLTX", na=False)
                     ).any()
                 )
+
+    def test_validation_sheet_flags_expired_orphan_close(self):
+        current_year = datetime.datetime.now().year
+        expired_year = current_year - 1
+        option_symbol = f"MSFT Jan 16 '{str(expired_year)[-2:]} $395 Call"
+        close_date = f"01/20/{expired_year}"
+        combined = [
+            {
+                "symbol": option_symbol,
+                "epoch": 1,
+                "open": None,
+                "close": {
+                    "symbol": option_symbol,
+                    "date": close_date,
+                    "action": "Sell Close",
+                    "quantity": 2,
+                    "price": Decimal("84.98"),
+                    "order_id": 17901,
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_base = os.path.join(temp_dir, "orders_output.csv")
+            write_excel_output(combined, out_base)
+            output_file = os.path.join(temp_dir, f"orders_output_{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx")
+
+            validation = pd.read_excel(output_file, sheet_name="Validation Issues")
+            self.assertEqual(1, len(validation))
+            self.assertEqual("historical_orphan_close", validation.iloc[0]["ValidationIssueType"])
+            self.assertEqual("Sell Close", validation.iloc[0]["Close Action"])
+
+    def test_validation_sheet_skips_split_quantity_when_net_balanced(self):
+        current_year = datetime.datetime.now().year
+        expired_year = current_year - 1
+        option_symbol = f"MSFT Jan 16 '{str(expired_year)[-2:]} $405 Call"
+        open_date = f"01/05/{expired_year}"
+        close_date = f"01/12/{expired_year}"
+        combined = [
+            {
+                "symbol": option_symbol,
+                "epoch": 1,
+                "open": {
+                    "symbol": option_symbol,
+                    "date": open_date,
+                    "action": "Sell Open",
+                    "quantity": 2,
+                    "price": Decimal("100.00"),
+                    "order_id": 17001,
+                },
+                "close": {
+                    "symbol": option_symbol,
+                    "date": close_date,
+                    "action": "Buy Close",
+                    "quantity": 1,
+                    "price": Decimal("75.08"),
+                    "order_id": 17002,
+                },
+            },
+            {
+                "symbol": option_symbol,
+                "epoch": 2,
+                "open": None,
+                "close": {
+                    "symbol": option_symbol,
+                    "date": close_date,
+                    "action": "Buy Close",
+                    "quantity": 1,
+                    "price": Decimal("70.00"),
+                    "order_id": 17003,
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_base = os.path.join(temp_dir, "orders_output.csv")
+            write_excel_output(combined, out_base)
+            output_file = os.path.join(temp_dir, f"orders_output_{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx")
+
+            validation = pd.read_excel(output_file, sheet_name="Validation Issues")
+            self.assertTrue(validation.empty)
+
+    def test_validation_summary_includes_cash_totals(self):
+        current_year = datetime.datetime.now().year
+        expired_year = current_year - 1
+        option_symbol = f"MSFT Jan 16 '{str(expired_year)[-2:]} $395 Call"
+        close_date = f"01/20/{expired_year}"
+        combined = [
+            {
+                "symbol": option_symbol,
+                "epoch": 1,
+                "open": None,
+                "close": {
+                    "symbol": option_symbol,
+                    "date": close_date,
+                    "action": "Sell Close",
+                    "quantity": 2,
+                    "price": Decimal("84.98"),
+                    "total_in": Decimal("16996.00"),
+                    "total_out": Decimal("0.00"),
+                    "order_id": 17901,
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_base = os.path.join(temp_dir, "orders_output.csv")
+            write_excel_output(combined, out_base)
+            output_file = os.path.join(temp_dir, f"orders_output_{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx")
+
+            summary = pd.read_excel(output_file, sheet_name="Validation Summary")
+            self.assertIn("Net Cash Impact", summary.columns)
+            self.assertIn("Gross Cash Moved", summary.columns)
+            self.assertEqual(16996.00, float(summary.iloc[0]["Net Cash Impact"]))
+            self.assertEqual(16996.00, float(summary.iloc[0]["Gross Cash Moved"]))
+
+    def test_fetch_executed_orders_buy_close_is_negative_cash_flow(self):
+        class FakeOrderApi:
+            def list_orders(self, account_id_key, marker, count, from_date, to_date):
+                return {
+                    "OrdersResponse": {
+                        "Order": [
+                            {
+                                "orderId": 20001,
+                                "OrderDetail": [
+                                    {
+                                        "status": "EXECUTED",
+                                        "executedTime": 1700000000000,
+                                        "Instrument": [
+                                            {
+                                                "symbolDescription": "MSFT Jan 16 '25 $395 Call",
+                                                "orderAction": "BUY_CLOSE",
+                                                "filledQuantity": 2,
+                                                "averageExecutionPrice": "84.98",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                        "marker": None,
+                    }
+                }
+
+        opens, closes = fetch_executed_orders(
+            etrade_order=FakeOrderApi(),
+            account_id_key="dummy",
+            from_dt=datetime.datetime.now() - datetime.timedelta(days=30),
+            to_dt=datetime.datetime.now(),
+            action_mapping={
+                "BUY_CLOSE": "Buy Close",
+                "BUY_OPEN": "Buy Open",
+                "SELL_CLOSE": "Sell Close",
+                "SELL_OPEN": "Sell Open",
+                "BUY": "Buy",
+                "SELL": "Sell",
+            },
+        )
+
+        self.assertEqual(0, len(opens))
+        self.assertEqual(1, len(closes))
+        self.assertEqual("Buy Close", closes[0]["action"])
+        self.assertEqual(Decimal("0"), closes[0]["total_in"])
+        self.assertEqual(Decimal("-16996.00"), closes[0]["total_out"])
 
 
 if __name__ == "__main__":
