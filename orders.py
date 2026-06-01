@@ -124,6 +124,310 @@ def parse_expiration_date(symbol: str) -> datetime.datetime:
         return None
 
 
+def parse_option_details(symbol: str) -> dict:
+    """Parses key details from a human-readable option symbol description."""
+    if not symbol:
+        return None
+
+    match = re.match(
+        r"^(?P<ticker>[A-Z][A-Z0-9\.\-]*)\s+[A-Za-z]{3}\s+\d{1,2}\s+'?\d{2}\s+\$(?P<strike>\d+(?:\.\d+)?)\s+(?P<option_type>Call|Put)\b",
+        symbol
+    )
+    if not match:
+        return None
+
+    try:
+        strike = Decimal(match.group("strike"))
+    except Exception:
+        return None
+
+    return {
+        "ticker": match.group("ticker"),
+        "strike": strike,
+        "option_type": match.group("option_type")
+    }
+
+
+def parse_mmddyyyy(date_str: str):
+    if not date_str:
+        return None
+    try:
+        if isinstance(date_str, datetime.datetime):
+            return date_str.date()
+        if isinstance(date_str, datetime.date):
+            return date_str
+        value = str(date_str).strip()
+        if ' ' in value:
+            value = value.split(' ')[0]
+
+        for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(value, fmt).date()
+            except Exception:
+                pass
+
+        return datetime.date.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def get_leg_date(leg: dict):
+    if not leg:
+        return None
+
+    parsed_date = parse_mmddyyyy(leg.get("date"))
+    if parsed_date:
+        return parsed_date
+
+    epoch = leg.get("epoch")
+    if epoch is None:
+        return None
+
+    try:
+        epoch_int = int(epoch)
+        if epoch_int > 10 ** 11:
+            epoch_int = epoch_int / 1000
+        return datetime.datetime.fromtimestamp(epoch_int).date()
+    except Exception:
+        return None
+
+
+def close_on_or_after_option_expiration(option_symbol: str, close_leg: dict) -> bool:
+    expiration_dt = parse_expiration_date(option_symbol)
+    close_date = get_leg_date(close_leg)
+    if not expiration_dt or not close_date:
+        return False
+    return close_date >= expiration_dt.date()
+
+
+def leg_sort_value_ms(leg: dict) -> int:
+    if not leg:
+        return -1
+    epoch = leg.get("epoch")
+    if epoch is not None:
+        try:
+            return int(epoch)
+        except Exception:
+            pass
+
+    parsed_date = parse_mmddyyyy(leg.get("date"))
+    if parsed_date:
+        return int(datetime.datetime(parsed_date.year, parsed_date.month, parsed_date.day).timestamp() * 1000)
+    return -1
+
+
+def leg_distance_ms(first_leg: dict, second_leg: dict) -> int:
+    first_ms = leg_sort_value_ms(first_leg)
+    second_ms = leg_sort_value_ms(second_leg)
+    if first_ms < 0 or second_ms < 0:
+        return 10 ** 18
+    return abs(first_ms - second_ms)
+
+
+def ticker_hint_matches(stock_symbol: str, ticker: str) -> bool:
+    if not stock_symbol or not ticker:
+        return False
+
+    stock_symbol_upper = stock_symbol.upper()
+    ticker_upper = ticker.upper()
+    if f"({ticker_upper})" in stock_symbol_upper:
+        return True
+
+    tokens = re.findall(r"[A-Z]+", stock_symbol_upper)
+    return ticker_upper in tokens
+
+
+def link_short_put_assignments(combined: list) -> dict:
+    """
+    Links short-put assignment candidates to related stock buy/sell legs.
+
+    Returns a mapping by combined-entry index:
+    {
+        put_entry_idx: {
+            "status": "ASSIGNED_LINKED"|"ASSIGNED_AMBIGUOUS"|"ASSIGNED_UNRESOLVED",
+            "buy_entry_idx": int|None,
+            "sell_legs": [close_leg, ...]
+        }
+    }
+    """
+    assignment_links = {}
+    used_buy_entry_indices = set()
+    used_close_only_sell_entry_indices = set()
+
+    stock_buy_entries = []
+    close_only_stock_sell_entries = []
+
+    for idx, entry in enumerate(combined):
+        symbol = entry.get("symbol", "")
+        if " Put" in symbol or " Call" in symbol:
+            continue
+
+        opening = entry.get("open")
+        closing = entry.get("close")
+
+        if opening and opening.get("action") == "Buy":
+            stock_buy_entries.append((idx, entry))
+
+        if (not opening) and closing and closing.get("action") == "Sell":
+            close_only_stock_sell_entries.append((idx, entry))
+
+    seven_days_ms = 7 * 24 * 60 * 60 * 1000
+    six_hours_ms = 6 * 60 * 60 * 1000
+    one_day_ms = 24 * 60 * 60 * 1000
+    three_days_ms = 3 * one_day_ms
+
+    for put_idx, put_entry in enumerate(combined):
+        opening = put_entry.get("open")
+        closing = put_entry.get("close")
+
+        if not opening or not closing:
+            continue
+        if opening.get("action") != "Sell Open":
+            continue
+        if " Put" not in opening.get("symbol", ""):
+            continue
+        if closing.get("action") != "Buy Close":
+            continue
+        if closing.get("is_expired"):
+            continue
+
+        close_price = closing.get("price")
+        if close_price is None:
+            continue
+
+        try:
+            close_price_decimal = Decimal(str(close_price))
+        except Exception:
+            continue
+
+        if close_price_decimal != Decimal("0.00"):
+            continue
+
+        likely_expired_close = close_on_or_after_option_expiration(opening.get("symbol", ""), closing)
+
+        option_details = parse_option_details(opening.get("symbol", ""))
+        expected_share_qty = int(opening.get("quantity", 0)) * 100
+
+        if not option_details or expected_share_qty <= 0:
+            if likely_expired_close:
+                continue
+            assignment_links[put_idx] = {
+                "status": "ASSIGNED_UNRESOLVED",
+                "buy_entry_idx": None,
+                "sell_legs": []
+            }
+            continue
+
+        strike = option_details["strike"]
+        ticker = option_details["ticker"]
+
+        candidates = []
+        for buy_idx, buy_entry in stock_buy_entries:
+            if buy_idx in used_buy_entry_indices:
+                continue
+
+            buy_open = buy_entry.get("open")
+            if not buy_open:
+                continue
+
+            if int(buy_open.get("quantity", 0)) != expected_share_qty:
+                continue
+
+            buy_price = buy_open.get("price")
+            if buy_price is None or abs(Decimal(str(buy_price)) - strike) > Decimal("0.01"):
+                continue
+
+            distance_ms = leg_distance_ms(closing, buy_open)
+            if distance_ms > seven_days_ms:
+                continue
+
+            score = 0
+            if distance_ms <= six_hours_ms:
+                score += 4
+            elif distance_ms <= one_day_ms:
+                score += 3
+            elif distance_ms <= three_days_ms:
+                score += 2
+            else:
+                score += 1
+
+            if ticker_hint_matches(buy_open.get("symbol", buy_entry.get("symbol", "")), ticker):
+                score += 2
+
+            candidates.append((score, distance_ms, buy_idx))
+
+        if not candidates:
+            if likely_expired_close:
+                continue
+            assignment_links[put_idx] = {
+                "status": "ASSIGNED_UNRESOLVED",
+                "buy_entry_idx": None,
+                "sell_legs": []
+            }
+            continue
+
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best = candidates[0]
+
+        if len(candidates) > 1 and candidates[1][0] == best[0] and candidates[1][1] == best[1]:
+            assignment_links[put_idx] = {
+                "status": "ASSIGNED_AMBIGUOUS",
+                "buy_entry_idx": None,
+                "sell_legs": []
+            }
+            continue
+
+        linked_buy_idx = best[2]
+        linked_buy_entry = combined[linked_buy_idx]
+        used_buy_entry_indices.add(linked_buy_idx)
+
+        linked_sell_legs = []
+        linked_buy_close = linked_buy_entry.get("close")
+        matched_sell_qty = 0
+
+        if linked_buy_close and linked_buy_close.get("action") == "Sell":
+            linked_sell_legs.append(linked_buy_close)
+            matched_sell_qty += int(linked_buy_close.get("quantity", 0) or 0)
+
+        remaining_qty = expected_share_qty - matched_sell_qty
+        if remaining_qty > 0:
+            buy_symbol = linked_buy_entry.get("symbol")
+            buy_open_ms = leg_sort_value_ms(linked_buy_entry.get("open"))
+
+            additional_candidates = []
+            for sell_idx, sell_entry in close_only_stock_sell_entries:
+                if sell_idx in used_close_only_sell_entry_indices:
+                    continue
+                if sell_entry.get("symbol") != buy_symbol:
+                    continue
+
+                close_leg = sell_entry.get("close")
+                if not close_leg or close_leg.get("action") != "Sell":
+                    continue
+
+                close_ms = leg_sort_value_ms(close_leg)
+                if buy_open_ms >= 0 and close_ms >= 0 and close_ms < buy_open_ms:
+                    continue
+
+                additional_candidates.append((close_ms, sell_idx, close_leg))
+
+            additional_candidates.sort(key=lambda item: (item[0], item[1]))
+            for _, sell_idx, close_leg in additional_candidates:
+                linked_sell_legs.append(close_leg)
+                used_close_only_sell_entry_indices.add(sell_idx)
+                remaining_qty -= int(close_leg.get("quantity", 0) or 0)
+                if remaining_qty <= 0:
+                    break
+
+        assignment_links[put_idx] = {
+            "status": "ASSIGNED_LINKED",
+            "buy_entry_idx": linked_buy_idx,
+            "sell_legs": linked_sell_legs
+        }
+
+    return assignment_links
+
+
 def add_expired_worthless_orders(opens: list, closes: list):
     """Adds synthetic closing orders for options that expired worthless."""
     now = datetime.datetime.now()
@@ -354,6 +658,18 @@ def load_previous_output(output_file: str) -> list:
 
     all_history = []
 
+    def normalize_column_name(col_name: str) -> str:
+        return re.sub(r'\s+', ' ', str(col_name)).strip()
+
+    def parse_quantity(qty_value):
+        if pd.isna(qty_value):
+            return None
+        try:
+            qty = int(float(str(qty_value).replace(',', '').strip()))
+            return qty if qty > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     if xlsx_file and os.path.exists(xlsx_file):
         try:
             xls = pd.ExcelFile(xlsx_file)
@@ -366,6 +682,9 @@ def load_previous_output(output_file: str) -> list:
                 df = df.dropna(how='all')
                 if df.empty:
                     continue
+
+                # Normalize whitespace so headers like "Open\nQuantity" map to "Open Quantity"
+                df.rename(columns={col: normalize_column_name(col) for col in df.columns}, inplace=True)
 
                 # Standardize columns (some might be missing in older versions)
                 required_cols = [
@@ -395,36 +714,43 @@ def load_previous_output(output_file: str) -> list:
                     if pd.isna(row['Symbol']):
                         continue
 
+                    # Skip synthetic assignment rows from previously generated short-put tabs.
+                    # They are reporting-only duplicates of stock legs and should not be reloaded
+                    # as historical source trades.
+                    strategy_event = str(row.get('Strategy Event')).strip().upper() if pd.notna(row.get('Strategy Event')) else ''
+                    if strategy_event in {'ASSIGNMENT BUY', 'ASSIGNMENT SELL'}:
+                        continue
+
                     # Reconstruct 'open' part
                     opening = None
-                    if pd.notna(row['Open Date']):
+                    open_qty = parse_quantity(row['Open Quantity'])
+                    if pd.notna(row['Open Date']) and open_qty is not None:
                         opening = {
                             "symbol": str(row['Symbol']),
                             "date": str(row['Open Date']),
                             "action": str(row['Open Action']),
-                            "quantity": int(row['Open Quantity']) if pd.notna(row['Open Quantity']) else 0,
+                            "quantity": open_qty,
                             "price": Decimal(str(row['Open Price'])) if pd.notna(row['Open Price']) else None,
                             "total_in": Decimal(str(row['Open Total In'])) if pd.notna(row['Open Total In']) else 0,
                             "total_out": Decimal(str(row['Open Total Out'])) if pd.notna(row['Open Total Out']) else 0,
                             "order_id": row.get('Open Order ID') if pd.notna(row.get('Open Order ID')) else None,
                         }
                         # Try to reconstruct epoch from date
-                        try:
-                            date_str = str(row['Open Date'])
-                            if ' ' in date_str: date_str = date_str.split(' ')[0] # handle datetime objects
-                            dt = datetime.datetime.strptime(date_str, "%m/%d/%Y")
-                            opening["epoch"] = int(dt.timestamp() * 1000)
-                        except:
+                        parsed_open_date = parse_mmddyyyy(row['Open Date'])
+                        if parsed_open_date:
+                            opening["epoch"] = int(datetime.datetime(parsed_open_date.year, parsed_open_date.month, parsed_open_date.day).timestamp() * 1000)
+                        else:
                             opening["epoch"] = None
                     
                     # Reconstruct 'close' part
                     closing = None
-                    if pd.notna(row['Close Date']):
+                    close_qty = parse_quantity(row['Close Quantity'])
+                    if pd.notna(row['Close Date']) and close_qty is not None:
                         closing = {
                             "symbol": str(row['Symbol']),
                             "date": str(row['Close Date']),
                             "action": str(row['Close Action']),
-                            "quantity": int(row['Close Quantity']) if pd.notna(row['Close Quantity']) else 0,
+                            "quantity": close_qty,
                             "price": Decimal(str(row['Close Price'])) if pd.notna(row['Close Price']) else None,
                             "total_in": Decimal(str(row['Close Total In'])) if pd.notna(row['Close Total In']) else 0,
                             "total_out": Decimal(str(row['Close Total Out'])) if pd.notna(row['Close Total Out']) else 0,
@@ -432,12 +758,10 @@ def load_previous_output(output_file: str) -> list:
                             "order_id": row.get('Close Order ID') if pd.notna(row.get('Close Order ID')) else None,
                         }
                         # Try to reconstruct epoch from date
-                        try:
-                            date_str = str(row['Close Date'])
-                            if ' ' in date_str: date_str = date_str.split(' ')[0]
-                            dt = datetime.datetime.strptime(date_str, "%m/%d/%Y")
-                            closing["epoch"] = int(dt.timestamp() * 1000)
-                        except:
+                        parsed_close_date = parse_mmddyyyy(row['Close Date'])
+                        if parsed_close_date:
+                            closing["epoch"] = int(datetime.datetime(parsed_close_date.year, parsed_close_date.month, parsed_close_date.day).timestamp() * 1000)
+                        else:
                             closing["epoch"] = None
 
                     trade = {
@@ -446,7 +770,8 @@ def load_previous_output(output_file: str) -> list:
                         "open": opening,
                         "close": closing
                     }
-                    all_history.append(trade)
+                    if opening or closing:
+                        all_history.append(trade)
         except Exception as e:
             print(f"Warning: Could not load previous Excel output file: {e}")
 
@@ -457,46 +782,54 @@ def load_previous_output(output_file: str) -> list:
             df = pd.read_csv('orders_output.csv')
             # Filter out completely empty rows
             df = df.dropna(how='all')
+            df.rename(columns={col: normalize_column_name(col) for col in df.columns}, inplace=True)
             
             # Map back to internal 'combined' structure
             for _, row in df.iterrows():
                 # Skip if symbol is missing
                 if pd.isna(row['Symbol']):
                     continue
+
+                strategy_event = str(row.get('Strategy Event')).strip().upper() if pd.notna(row.get('Strategy Event')) else ''
+                if strategy_event in {'ASSIGNMENT BUY', 'ASSIGNMENT SELL'}:
+                    continue
+
                 # Reconstruct 'open' part
                 opening = None
-                if pd.notna(row['Open Date']):
+                open_qty = parse_quantity(row['Open Quantity'])
+                if pd.notna(row['Open Date']) and open_qty is not None:
                     opening = {
                         "symbol": str(row['Symbol']),
                         "date": str(row['Open Date']),
                         "action": str(row['Open Action']),
-                        "quantity": int(row['Open Quantity']) if pd.notna(row['Open Quantity']) else 0,
+                        "quantity": open_qty,
                         "price": Decimal(str(row['Open Price'])) if pd.notna(row['Open Price']) else None,
                         "total_in": Decimal(str(row['Open Total In'])) if pd.notna(row['Open Total In']) else 0,
                         "total_out": Decimal(str(row['Open Total Out'])) if pd.notna(row['Open Total Out']) else 0,
                     }
-                    try:
-                        dt = datetime.datetime.strptime(str(row['Open Date']), "%m/%d/%Y")
-                        opening["epoch"] = int(dt.timestamp() * 1000)
-                    except:
+                    parsed_open_date = parse_mmddyyyy(row['Open Date'])
+                    if parsed_open_date:
+                        opening["epoch"] = int(datetime.datetime(parsed_open_date.year, parsed_open_date.month, parsed_open_date.day).timestamp() * 1000)
+                    else:
                         opening["epoch"] = None
                 
                 # Reconstruct 'close' part
                 closing = None
-                if pd.notna(row['Close Date']):
+                close_qty = parse_quantity(row['Close Quantity'])
+                if pd.notna(row['Close Date']) and close_qty is not None:
                     closing = {
                         "symbol": str(row['Symbol']),
                         "date": str(row['Close Date']),
                         "action": str(row['Close Action']),
-                        "quantity": int(row['Close Quantity']) if pd.notna(row['Close Quantity']) else 0,
+                        "quantity": close_qty,
                         "price": Decimal(str(row['Close Price'])) if pd.notna(row['Close Price']) else None,
                         "total_in": Decimal(str(row['Close Total In'])) if pd.notna(row['Close Total In']) else 0,
                         "total_out": Decimal(str(row['Close Total Out'])) if pd.notna(row['Close Total Out']) else 0,
                     }
-                    try:
-                        dt = datetime.datetime.strptime(str(row['Close Date']), "%m/%d/%Y")
-                        closing["epoch"] = int(dt.timestamp() * 1000)
-                    except:
+                    parsed_close_date = parse_mmddyyyy(row['Close Date'])
+                    if parsed_close_date:
+                        closing["epoch"] = int(datetime.datetime(parsed_close_date.year, parsed_close_date.month, parsed_close_date.day).timestamp() * 1000)
+                    else:
                         closing["epoch"] = None
 
                 trade = {
@@ -505,7 +838,8 @@ def load_previous_output(output_file: str) -> list:
                     "open": opening,
                     "close": closing
                 }
-                all_history.append(trade)
+                if opening or closing:
+                    all_history.append(trade)
         except Exception as e:
             print(f"Warning: Could not load legacy CSV file: {e}")
 
@@ -516,14 +850,52 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
     """
     Merges old and new trades using a hybrid ID and fingerprint approach.
     """
+    def normalize_date_for_key(date_value):
+        parsed_date = parse_mmddyyyy(date_value)
+        if parsed_date:
+            return parsed_date.isoformat()
+
+        raw = str(date_value).strip() if date_value is not None else ""
+        if ' ' in raw:
+            raw = raw.split(' ')[0]
+        return raw
+
+    def normalize_price_for_key(price_value):
+        if price_value is None:
+            return ""
+        try:
+            price = Decimal(str(price_value))
+            return str(price.normalize())
+        except Exception:
+            return str(price_value)
+
     def get_fingerprint(trade_leg):
         if not trade_leg:
             return None
+        symbol = str(trade_leg.get('symbol', '')).strip()
+        date_key = normalize_date_for_key(trade_leg.get('date'))
+        action = str(trade_leg.get('action', '')).strip()
+        quantity = int(trade_leg.get('quantity', 0) or 0)
+        price_key = normalize_price_for_key(trade_leg.get('price'))
         # Fingerprint: Symbol|Date|Action|Quantity|Price
-        return f"{trade_leg['symbol']}|{trade_leg['date']}|{trade_leg['action']}|{trade_leg['quantity']}|{trade_leg['price']}"
+        return f"{symbol}|{date_key}|{action}|{quantity}|{price_key}"
+
+    def get_order_leg_key(trade_leg):
+        if not trade_leg:
+            return None
+        order_id = trade_leg.get('order_id')
+        if order_id is None:
+            return None
+
+        symbol = str(trade_leg.get('symbol', '')).strip()
+        action = str(trade_leg.get('action', '')).strip()
+        quantity = int(trade_leg.get('quantity', 0) or 0)
+        price_key = normalize_price_for_key(trade_leg.get('price'))
+        date_key = normalize_date_for_key(trade_leg.get('date'))
+        return f"{order_id}|{symbol}|{action}|{quantity}|{price_key}|{date_key}"
 
     # We want to keep track of legs (opens and closes) independently to ensure full deduplication
-    seen_ids = set()
+    seen_order_leg_keys = set()
     seen_fingerprints = set()
     
     unique_trades = []
@@ -540,16 +912,16 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
         
         if o:
             legs_count += 1
-            o_id = o.get('order_id')
+            o_id_key = get_order_leg_key(o)
             o_fp = get_fingerprint(o)
-            if (o_id and o_id in seen_ids) or (o_fp in seen_fingerprints):
+            if (o_id_key and o_id_key in seen_order_leg_keys) or (o_fp in seen_fingerprints):
                 legs_seen += 1
-        
+
         if c:
             legs_count += 1
-            c_id = c.get('order_id')
+            c_id_key = get_order_leg_key(c)
             c_fp = get_fingerprint(c)
-            if (c_id and c_id in seen_ids) or (c_fp in seen_fingerprints):
+            if (c_id_key and c_id_key in seen_order_leg_keys) or (c_fp in seen_fingerprints):
                 legs_seen += 1
                 
         if legs_seen < legs_count:
@@ -558,10 +930,14 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
             
             # Mark legs as seen
             if o:
-                if o.get('order_id'): seen_ids.add(o.get('order_id'))
+                o_id_key = get_order_leg_key(o)
+                if o_id_key:
+                    seen_order_leg_keys.add(o_id_key)
                 seen_fingerprints.add(get_fingerprint(o))
             if c:
-                if c.get('order_id'): seen_ids.add(c.get('order_id'))
+                c_id_key = get_order_leg_key(c)
+                if c_id_key:
+                    seen_order_leg_keys.add(c_id_key)
                 seen_fingerprints.add(get_fingerprint(c))
                 
     return unique_trades
@@ -589,10 +965,104 @@ def write_excel_output(combined: list, output_file: str):
     output_file = f"{output_file}_{datestr}.xlsx"
 
     rows = []
-    for entry in sorted(combined, key=lambda x: (x['symbol'], x['epoch'])):
+    assignment_links = link_short_put_assignments(combined)
+    assignment_linked_buy_indices = {
+        info.get("buy_entry_idx")
+        for info in assignment_links.values()
+        if info.get("status") == "ASSIGNED_LINKED" and info.get("buy_entry_idx") is not None
+    }
+
+    def assignment_leg_key(leg: dict):
+        if not leg:
+            return None
+        symbol = str(leg.get('symbol', '')).strip()
+        action = str(leg.get('action', '')).strip()
+        quantity = int(leg.get('quantity', 0) or 0)
+        date_value = parse_mmddyyyy(leg.get('date'))
+        date_key = date_value.isoformat() if date_value else str(leg.get('date') or '').split(' ')[0]
+        try:
+            price_key = str(Decimal(str(leg.get('price'))).normalize()) if leg.get('price') is not None else ""
+        except Exception:
+            price_key = str(leg.get('price'))
+        order_id_key = str(leg.get('order_id') or '')
+        return f"{symbol}|{action}|{quantity}|{price_key}|{date_key}|{order_id_key}"
+
+    assignment_linked_sell_keys = {
+        assignment_leg_key(sell_leg)
+        for info in assignment_links.values()
+        if info.get("status") == "ASSIGNED_LINKED"
+        for sell_leg in info.get("sell_legs", [])
+        if assignment_leg_key(sell_leg)
+    }
+
+    entries_with_indices = list(enumerate(combined))
+
+    def parse_to_datetime(date_str):
+        if not date_str:
+            return None
+        try:
+            # Handle potential mixed formats or objects
+            if isinstance(date_str, (datetime.datetime, datetime.date)):
+                return datetime.datetime(date_str.year, date_str.month, date_str.day)
+            return datetime.datetime.strptime(date_str, "%m/%d/%Y")
+        except Exception:
+            return date_str
+
+    def determine_close_year(close_leg):
+        if not close_leg:
+            return None
+
+        close_epoch = close_leg.get('epoch')
+        if close_epoch is not None:
+            try:
+                close_time = datetime.datetime.fromtimestamp(int(close_epoch) / 1000)
+                if close_time.year > 1980:
+                    return close_time.year
+            except Exception:
+                pass
+
+        parsed_date = parse_mmddyyyy(close_leg.get('date'))
+        if parsed_date and parsed_date.year > 1980:
+            return parsed_date.year
+        return None
+
+    def build_row_data(symbol, opening, closing, is_sold_put, close_year, strategy_link_id=None, strategy_event=None, assignment_status=None):
+        return {
+            "Symbol": symbol,
+            "Open Date": parse_to_datetime(opening.get('date')) if opening else None,
+            "Open Action": opening.get('action') if opening else None,
+            "Open\nQuantity": opening.get('quantity') if opening else None,
+            "Open Price": float(opening.get('price')) if opening and opening.get('price') is not None else None,
+            "Open Total Out": float(opening.get('total_out')) if opening and opening.get('total_out') is not None else None,
+            "Open Total In": float(opening.get('total_in')) if opening and opening.get('total_in') is not None else None,
+            "Close Date": parse_to_datetime(closing.get('date')) if closing else None,
+            "Close Action": closing.get('action') if closing else None,
+            "Close\nQuantity": closing.get('quantity') if closing else None,
+            "Close Price": float(closing.get('price')) if closing and closing.get('price') is not None else None,
+            "Close Total In": float(closing.get('total_in')) if closing and closing.get('total_in') is not None else None,
+            "Close Total Out": float(closing.get('total_out')) if closing and closing.get('total_out') is not None else None,
+            "EXPIRED": "EXPIRED" if closing and closing.get('is_expired') else "",
+            "Open Order ID": opening.get('order_id') if opening else None,
+            "Close Order ID": closing.get('order_id') if closing else None,
+            "Strategy Link ID": strategy_link_id,
+            "Strategy Event": strategy_event,
+            "Assignment Status": assignment_status,
+            "_is_sold_put": is_sold_put,
+            "_close_year": close_year
+        }
+
+    for entry_idx, entry in sorted(entries_with_indices, key=lambda item: (item[1]['symbol'], item[1]['epoch'])):
         o = entry['open']
         c = entry['close']
-        
+
+        if entry_idx in assignment_linked_buy_indices:
+            continue
+
+        if (not o) and c and c.get('action') == 'Sell':
+            close_key = assignment_leg_key(c)
+            if close_key and close_key in assignment_linked_sell_keys:
+                continue
+
         # Determine if it's a "sold put"
         # A sold put is typically an opening transaction with "Sell Open" action and "Put" in symbol
         is_sold_put = False
@@ -605,46 +1075,70 @@ def write_excel_output(combined: list, output_file: str):
             # For now, let's stick to the opening action if available.
             pass
 
-        # Determine closing year
-        close_year = None
-        if c and c.get('epoch') is not None:
-            # executed_time is in milliseconds
-            close_time = datetime.datetime.fromtimestamp(c['epoch'] / 1000)
-            if close_time.year > 1980: # Filter out bogus dates
-                close_year = close_time.year
+        close_year = determine_close_year(c)
+        assignment_info = assignment_links.get(entry_idx)
 
-        def parse_to_datetime(date_str):
-            if not date_str:
-                return None
-            try:
-                # Handle potential mixed formats or objects
-                if isinstance(date_str, (datetime.datetime, datetime.date)):
-                    return datetime.datetime(date_str.year, date_str.month, date_str.day)
-                return datetime.datetime.strptime(date_str, "%m/%d/%Y")
-            except Exception:
-                return date_str
-        
-        row_data = {
-            "Symbol": (o or c).get('symbol'),
-            "Open Date": parse_to_datetime(o.get('date')) if o else None,
-            "Open Action": o.get('action') if o else None,
-            "Open\nQuantity": o.get('quantity') if o else None,
-            "Open Price": float(o.get('price')) if o else None,
-            "Open Total Out": float(o.get('total_out')) if o else None,
-            "Open Total In": float(o.get('total_in')) if o else None,
-            "Close Date": parse_to_datetime(c.get('date')) if c else None,
-            "Close Action": c.get('action') if c else None,
-            "Close\nQuantity": c.get('quantity') if c else None,
-            "Close Price": float(c.get('price')) if c else None,
-            "Close Total In": float(c.get('total_in')) if c else None,
-            "Close Total Out": float(c.get('total_out')) if c else None,
-            "EXPIRED": "EXPIRED" if c and c.get('is_expired') else "",
-            "Open Order ID": o.get('order_id') if o else None,
-            "Close Order ID": c.get('order_id') if c else None,
-            "_is_sold_put": is_sold_put,
-            "_close_year": close_year
-        }
+        strategy_link_id = None
+        strategy_event = None
+        assignment_status = None
+        if assignment_info:
+            strategy_link_id = f"SPASSIGN-{(o or c).get('order_id') or entry_idx}"
+            strategy_event = "SHORT PUT"
+            assignment_status = assignment_info.get("status")
+
+        row_data = build_row_data(
+            symbol=(o or c).get('symbol'),
+            opening=o,
+            closing=c,
+            is_sold_put=is_sold_put,
+            close_year=close_year,
+            strategy_link_id=strategy_link_id,
+            strategy_event=strategy_event,
+            assignment_status=assignment_status
+        )
         rows.append(row_data)
+
+        if assignment_info and assignment_info.get("status") == "ASSIGNED_LINKED":
+            buy_entry_idx = assignment_info.get("buy_entry_idx")
+            linked_buy_entry = None
+            linked_buy_symbol = None
+            if buy_entry_idx is not None:
+                linked_buy_entry = combined[buy_entry_idx]
+                linked_buy_open = linked_buy_entry.get("open")
+                linked_buy_close = linked_buy_entry.get("close")
+                linked_buy_symbol = linked_buy_entry.get("symbol")
+                assignment_buy_close_year = (
+                    determine_close_year(linked_buy_close)
+                    or determine_close_year(c)
+                    or determine_close_year(linked_buy_open)
+                )
+
+                assignment_buy_row = build_row_data(
+                    symbol=linked_buy_symbol,
+                    opening=linked_buy_open,
+                    closing={},
+                    is_sold_put=True,
+                    close_year=assignment_buy_close_year,
+                    strategy_link_id=strategy_link_id,
+                    strategy_event="ASSIGNMENT BUY",
+                    assignment_status="ASSIGNED_LINKED"
+                )
+                rows.append(assignment_buy_row)
+
+            for sell_leg in assignment_info.get("sell_legs", []):
+                if not sell_leg:
+                    continue
+                assignment_sell_row = build_row_data(
+                    symbol=sell_leg.get("symbol") or linked_buy_symbol,
+                    opening={},
+                    closing=sell_leg,
+                    is_sold_put=True,
+                    close_year=determine_close_year(sell_leg),
+                    strategy_link_id=strategy_link_id,
+                    strategy_event="ASSIGNMENT SELL",
+                    assignment_status="ASSIGNED_LINKED"
+                )
+                rows.append(assignment_sell_row)
 
     # Convert to a DataFrame
     df_raw = pd.DataFrame(rows)

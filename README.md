@@ -34,7 +34,13 @@ Before using this tool, you need to set up your `etrade.properties` file:
    consumer_secret = "your_consumer_secret_here"
    account_id = "your_account_id_here"
    ```
-3. (Optional) Configure the output filename:
+3. (Optional) Set API environment (defaults to production):
+   ```
+   environment = "production"
+   # or: environment = "sandbox"
+   # or: use_sandbox = "true"
+   ```
+4. (Optional) Configure the output filename:
    ```
    output_file = "orders_output.xlsx"
    ```
@@ -78,6 +84,7 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 ## Troubleshooting
 
 - **401 Unauthorized Error:** Your tokens have expired. Run `python tokens.py` again.
+- **404 during `python tokens.py`:** Make sure you are using the latest project code and set the correct API environment (`environment = "production"` for PROD keys, `"sandbox"` for SANDBOX keys).
 - **"Bringing Forward" Data:** If you have an old manual spreadsheet, name it `orders_output.csv` in the root directory. The script will automatically migrate its data on the next run.
 - **Verification:** Run `python test_tokens_workflow.py` to check your API connection and token status.
 

@@ -14,6 +14,11 @@
 consumer_key = "YOUR_PRODUCTION_KEY"
 consumer_secret = "YOUR_PRODUCTION_SECRET"
 
+# Optional API environment (defaults to production)
+# environment = "production"
+# environment = "sandbox"
+# or: use_sandbox = "true"
+
 # Account configuration
 account_id = "YOUR_ACCOUNT_ID"
 
