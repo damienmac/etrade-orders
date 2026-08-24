@@ -2,10 +2,14 @@ import time
 import datetime
 import os
 import re
+import logging
 from decimal import Decimal
 from typing import Tuple
 import pyetrade
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 # Use current date range (two years ago to today)
 today = datetime.datetime.now()
@@ -434,72 +438,79 @@ def link_short_put_assignments(combined: list) -> dict:
 def add_expired_worthless_orders(opens: list, closes: list):
     """Adds synthetic closing orders for options that expired worthless."""
     now = datetime.datetime.now()
-    
-    # Track how many closes we already have for each symbol
-    existing_closes_count = {}
-    for c in closes:
-        symbol = c['symbol']
-        existing_closes_count[symbol] = existing_closes_count.get(symbol, 0) + 1
-        
-    # We want to add synthetic closes for any open that doesn't have a matching close
-    # and has expired.
-    
-    # First, let's count the opens
-    opens_count = {}
-    for o in opens:
-        symbol = o['symbol']
-        opens_count[symbol] = opens_count.get(symbol, 0) + 1
-        
-    # Now, for each symbol, if opens > closes and it's an expired option, 
-    # add (opens - closes) synthetic closes.
-    for symbol, count in opens_count.items():
-        exp_date = parse_expiration_date(symbol)
-        if exp_date and exp_date < now:
-            num_closes = existing_closes_count.get(symbol, 0)
-            if count > num_closes:
-                # Get list of opens for this symbol to iterate through
-                matching_opens = [o for o in opens if o['symbol'] == symbol]
-                
-                # Check how many we need to create
-                needed = count - num_closes
-                # For simplicity, we can just pick the last ones (presumably the most recent)
-                # or just any. Since we want to pair them, we should probably use the quantities
-                # of the unmatched opens.
-                
-                # We'll create one synthetic close for each unmatched open
-                # But wait, which ones are unmatched? 
-                # Match_trades will find any.
-                # Let's just create 'needed' synthetic closes using the quantities of some opens.
-                for i in range(needed):
-                    o_to_use = matching_opens[i]
-                    action = o_to_use.get('action', '')
-                    if action == "Buy Open":
-                        close_action = "Sell Close"
-                    elif action == "Sell Open":
-                        close_action = "Buy Close"
-                    else:
-                        continue
-                    
-                    # E*TRADE timestamps are in milliseconds.
-                    epoch = int(exp_date.timestamp() * 1000)
-                    
-                    # Create a unique-ish ID for synthetic orders to avoid duplicates
-                    # Format: SYNTH-[Symbol]-[Date]-[Action]
-                    synthetic_id = f"SYNTH-{symbol}-{exp_date.strftime('%Y%m%d')}-{close_action}"
 
-                    synthetic_close = {
-                        "symbol": symbol,
-                        "date": exp_date.strftime("%m/%d/%Y"),
-                        "epoch": epoch,
-                        "action": close_action,
-                        "quantity": o_to_use.get('quantity'),
-                        "price": Decimal("0.00"),
-                        "total_in": 0,
-                        "total_out": 0,
-                        "is_expired": True,
-                        "order_id": synthetic_id,
-                    }
-                    closes.append(synthetic_close)
+    opens_by_symbol = {}
+    for opening in opens:
+        symbol = opening.get('symbol')
+        if not symbol:
+            continue
+        opens_by_symbol.setdefault(symbol, []).append(opening)
+
+    for symbol, symbol_opens in opens_by_symbol.items():
+        exp_date = parse_expiration_date(symbol)
+        if not exp_date or exp_date >= now:
+            continue
+
+        long_opens = [o for o in symbol_opens if o.get('action') == "Buy Open"]
+        short_opens = [o for o in symbol_opens if o.get('action') == "Sell Open"]
+
+        total_long_open_qty = sum(int(o.get('quantity', 0) or 0) for o in long_opens)
+        total_short_open_qty = sum(int(o.get('quantity', 0) or 0) for o in short_opens)
+
+        total_sell_close_qty = sum(
+            int(c.get('quantity', 0) or 0)
+            for c in closes
+            if c.get('symbol') == symbol and c.get('action') == "Sell Close"
+        )
+        total_buy_close_qty = sum(
+            int(c.get('quantity', 0) or 0)
+            for c in closes
+            if c.get('symbol') == symbol and c.get('action') == "Buy Close"
+        )
+
+        long_unmatched_qty = max(0, total_long_open_qty - total_sell_close_qty)
+        short_unmatched_qty = max(0, total_short_open_qty - total_buy_close_qty)
+
+        # E*TRADE timestamps are in milliseconds.
+        epoch = int(exp_date.timestamp() * 1000)
+
+        def append_synthetics_from_opens(open_legs, close_action, unmatched_qty):
+            remaining = unmatched_qty
+            synth_index = 1
+            for opening in open_legs:
+                if remaining <= 0:
+                    break
+                open_qty = int(opening.get('quantity', 0) or 0)
+                if open_qty <= 0:
+                    continue
+                synth_qty = min(open_qty, remaining)
+                synthetic_id = f"SYNTH-{symbol}-{exp_date.strftime('%Y%m%d')}-{close_action}-{synth_index}"
+                synth_index += 1
+                synthetic_close = {
+                    "symbol": symbol,
+                    "date": exp_date.strftime("%m/%d/%Y"),
+                    "epoch": epoch,
+                    "action": close_action,
+                    "quantity": synth_qty,
+                    "price": Decimal("0.00"),
+                    "total_in": 0,
+                    "total_out": 0,
+                    "is_expired": True,
+                    "order_id": synthetic_id,
+                }
+                closes.append(synthetic_close)
+                if close_action in ("Buy Close", "Sell Close"):
+                    logger.error(
+                        "Synthetic %s created for expired option %s (qty=%s, open_order_id=%s)",
+                        close_action,
+                        symbol,
+                        synth_qty,
+                        opening.get("order_id"),
+                    )
+                remaining -= synth_qty
+
+        append_synthetics_from_opens(long_opens, "Sell Close", long_unmatched_qty)
+        append_synthetics_from_opens(short_opens, "Buy Close", short_unmatched_qty)
 
 
 def match_trades(opens: list, closes: list) -> list:
@@ -517,7 +528,7 @@ def match_trades(opens: list, closes: list) -> list:
     combined = []
     for closing in closes:
         matched = False
-        for opening in opens:
+        for opening_idx, opening in enumerate(opens):
             if closing['symbol'] == opening['symbol']:
                 match = {
                     "symbol": closing['symbol'],  # for sorting
@@ -528,7 +539,7 @@ def match_trades(opens: list, closes: list) -> list:
                 combined.append(match)
                 # print(f"COMBINED1 <-- {match}")
                 matched = True
-                opens.remove(opening)
+                opens.pop(opening_idx)
                 break
         if not matched:
             match = {
@@ -660,6 +671,7 @@ def load_previous_output(output_file: str) -> list:
         print(f"Loading previous trades from exact file: {xlsx_file}")
 
     all_history = []
+    loaded_from_excel = False
 
     def normalize_column_name(col_name: str) -> str:
         return re.sub(r'\s+', ' ', str(col_name)).strip()
@@ -676,6 +688,7 @@ def load_previous_output(output_file: str) -> list:
     if xlsx_file and os.path.exists(xlsx_file):
         try:
             xls = pd.ExcelFile(xlsx_file)
+            loaded_from_excel = True
             for sheet_name in xls.sheet_names:
                 if sheet_name == 'Dashboard':
                     continue
@@ -778,8 +791,10 @@ def load_previous_output(output_file: str) -> list:
         except Exception as e:
             print(f"Warning: Could not load previous Excel output file: {e}")
 
-    # ALSO load from legacy CSV if it exists to ensure we don't miss anything
-    if os.path.exists('orders_output.csv'):
+    # Merge legacy CSV only when no Excel history was loaded.
+    # If we already loaded a dated Excel baseline, always merging CSV can
+    # reintroduce stale open-only rows and corrupt close-link carry-forward.
+    if (not loaded_from_excel) and os.path.exists('orders_output.csv'):
         try:
             print(f"Merging legacy trades from CSV: orders_output.csv")
             df = pd.read_csv('orders_output.csv')
@@ -872,6 +887,23 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
         except Exception:
             return str(price_value)
 
+    def normalize_order_id_for_key(order_id_value):
+        if order_id_value is None:
+            return None
+        raw = str(order_id_value).strip()
+        if raw == "":
+            return None
+
+        # Normalize numerically-equivalent broker IDs loaded from mixed sources
+        # (e.g. 18166, 18166.0, "18166", "18166.0").
+        try:
+            dec = Decimal(raw)
+            if dec == dec.to_integral_value():
+                return str(int(dec))
+            return str(dec.normalize())
+        except Exception:
+            return raw
+
     def get_fingerprint(trade_leg):
         if not trade_leg:
             return None
@@ -886,7 +918,7 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
     def get_order_leg_key(trade_leg):
         if not trade_leg:
             return None
-        order_id = trade_leg.get('order_id')
+        order_id = normalize_order_id_for_key(trade_leg.get('order_id'))
         if order_id is None:
             return None
 
@@ -917,14 +949,14 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
             legs_count += 1
             o_id_key = get_order_leg_key(o)
             o_fp = get_fingerprint(o)
-            if (o_id_key and o_id_key in seen_order_leg_keys) or (o_fp in seen_fingerprints):
+            if (o_id_key and o_id_key in seen_order_leg_keys) or ((not o_id_key) and (o_fp in seen_fingerprints)):
                 legs_seen += 1
 
         if c:
             legs_count += 1
             c_id_key = get_order_leg_key(c)
             c_fp = get_fingerprint(c)
-            if (c_id_key and c_id_key in seen_order_leg_keys) or (c_fp in seen_fingerprints):
+            if (c_id_key and c_id_key in seen_order_leg_keys) or ((not c_id_key) and (c_fp in seen_fingerprints)):
                 legs_seen += 1
                 
         if legs_seen < legs_count:
@@ -934,16 +966,93 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
             # Mark legs as seen
             if o:
                 o_id_key = get_order_leg_key(o)
+                o_fp = get_fingerprint(o)
                 if o_id_key:
                     seen_order_leg_keys.add(o_id_key)
-                seen_fingerprints.add(get_fingerprint(o))
+                if o_fp:
+                    # Track fingerprints for all accepted legs (including those with
+                    # order IDs) so legacy rows without order IDs can still dedupe
+                    # against the same already-seen broker leg.
+                    seen_fingerprints.add(o_fp)
             if c:
                 c_id_key = get_order_leg_key(c)
+                c_fp = get_fingerprint(c)
                 if c_id_key:
                     seen_order_leg_keys.add(c_id_key)
-                seen_fingerprints.add(get_fingerprint(c))
+                if c_fp:
+                    seen_fingerprints.add(c_fp)
                 
-    return unique_trades
+    # Reconcile stale/duplicate rows for expired option contracts.
+    # 1) Keep legitimate unmatched opens, but drop open-only rows that duplicate
+    #    an open leg already represented by a closed row for the same expired symbol.
+    # 2) If the same open leg appears with both a real close and a synthetic close,
+    #    keep the real-close row and drop the synthetic duplicate row.
+    expired_symbols_with_closed_open_keys = {}
+    expired_symbols_open_keys_with_real_close = {}
+    expired_prior_year_symbols_closed_open_signatures = {}
+    current_year = datetime.date.today().year
+
+    def get_open_signature(trade_leg):
+        if not trade_leg:
+            return None
+        symbol = str(trade_leg.get('symbol', '')).strip()
+        date_key = normalize_date_for_key(trade_leg.get('date'))
+        action = str(trade_leg.get('action', '')).strip()
+        quantity = int(trade_leg.get('quantity', 0) or 0)
+        return f"{symbol}|{date_key}|{action}|{quantity}"
+
+    for trade in unique_trades:
+        close_leg = trade.get('close')
+        open_leg = trade.get('open')
+        if not close_leg or not open_leg:
+            continue
+        symbol = str((trade.get('symbol') or close_leg.get('symbol') or open_leg.get('symbol') or '')).strip()
+        expiration_dt = parse_expiration_date(symbol)
+        if not expiration_dt or expiration_dt.date() >= datetime.date.today():
+            continue
+
+        open_key = get_fingerprint(open_leg)
+        if open_key:
+            expired_symbols_with_closed_open_keys.setdefault(symbol, set()).add(open_key)
+            close_order_id = str(close_leg.get('order_id') or '')
+            if not close_order_id.startswith('SYNTH-'):
+                expired_symbols_open_keys_with_real_close.setdefault(symbol, set()).add(open_key)
+        if expiration_dt.year < current_year:
+            open_signature = get_open_signature(open_leg)
+            if open_signature:
+                expired_prior_year_symbols_closed_open_signatures.setdefault(symbol, set()).add(open_signature)
+
+    if not expired_symbols_with_closed_open_keys:
+        return unique_trades
+
+    reconciled_trades = []
+    for trade in unique_trades:
+        open_leg = trade.get('open')
+        close_leg = trade.get('close')
+        if open_leg and not close_leg:
+            symbol = str((trade.get('symbol') or open_leg.get('symbol') or '')).strip()
+            open_signatures = expired_prior_year_symbols_closed_open_signatures.get(symbol)
+            if open_signatures:
+                open_signature = get_open_signature(open_leg)
+                if open_signature in open_signatures:
+                    continue
+            closed_open_keys = expired_symbols_with_closed_open_keys.get(symbol)
+            if closed_open_keys:
+                open_key = get_fingerprint(open_leg)
+                if open_key in closed_open_keys:
+                    continue
+
+        if open_leg and close_leg:
+            symbol = str((trade.get('symbol') or close_leg.get('symbol') or open_leg.get('symbol') or '')).strip()
+            real_close_open_keys = expired_symbols_open_keys_with_real_close.get(symbol)
+            if real_close_open_keys:
+                open_key = get_fingerprint(open_leg)
+                close_order_id = str(close_leg.get('order_id') or '')
+                if open_key in real_close_open_keys and close_order_id.startswith('SYNTH-'):
+                    continue
+        reconciled_trades.append(trade)
+
+    return reconciled_trades
 
 
 def write_excel_output(combined: list, output_file: str):
@@ -969,6 +1078,7 @@ def write_excel_output(combined: list, output_file: str):
 
     rows = []
     validation_rows = []
+    this_year = datetime.datetime.now().year
     assignment_links = link_short_put_assignments(combined)
     assignment_linked_buy_indices = {
         info.get("buy_entry_idx")
@@ -1031,6 +1141,19 @@ def write_excel_output(combined: list, output_file: str):
         return None
 
     def build_row_data(symbol, opening, closing, is_sold_put, close_year, strategy_link_id=None, strategy_event=None, assignment_status=None):
+        close_price = None
+        if closing and closing.get('price') is not None:
+            try:
+                close_price = Decimal(str(closing.get('price')))
+            except Exception:
+                close_price = None
+
+        real_zero_close_after_expiration = (
+            closing
+            and close_price == Decimal("0")
+            and close_on_or_after_option_expiration(symbol, closing)
+        )
+
         return {
             "Symbol": symbol,
             "Open Date": parse_to_datetime(opening.get('date')) if opening else None,
@@ -1045,15 +1168,137 @@ def write_excel_output(combined: list, output_file: str):
             "Close Price": float(closing.get('price')) if closing and closing.get('price') is not None else None,
             "Close Total In": float(closing.get('total_in')) if closing and closing.get('total_in') is not None else None,
             "Close Total Out": float(closing.get('total_out')) if closing and closing.get('total_out') is not None else None,
-            "EXPIRED": "EXPIRED" if closing and closing.get('is_expired') else "",
+            "EXPIRED": "EXPIRED" if (closing and closing.get('is_expired')) or real_zero_close_after_expiration else "",
             "Open Order ID": opening.get('order_id') if opening else None,
             "Close Order ID": closing.get('order_id') if closing else None,
             "Strategy Link ID": strategy_link_id,
             "Strategy Event": strategy_event,
             "Assignment Status": assignment_status,
+            "Leg Status": "",
             "_is_sold_put": is_sold_put,
             "_close_year": close_year
         }
+
+    def append_leg_status(current_value, flag):
+        if not flag:
+            return current_value or ""
+        if not current_value:
+            return flag
+        parts = [p.strip() for p in str(current_value).split("|") if p.strip()]
+        if flag in parts:
+            return "|".join(parts)
+        parts.append(flag)
+        return "|".join(parts)
+
+    def annotate_leg_status(df_all: pd.DataFrame):
+        if df_all.empty:
+            return df_all
+
+        df = df_all.copy()
+        if "Leg Status" not in df.columns:
+            df["Leg Status"] = ""
+        else:
+            df["Leg Status"] = df["Leg Status"].fillna("")
+
+        open_only_mask = df["Open Action"].notna() & df["Close Action"].isna()
+        close_only_mask = df["Open Action"].isna() & df["Close Action"].notna()
+
+        df.loc[open_only_mask, "Leg Status"] = df.loc[open_only_mask, "Leg Status"].apply(
+            lambda x: append_leg_status(x, "OPEN_WITHOUT_CLOSE")
+        )
+        df.loc[close_only_mask, "Leg Status"] = df.loc[close_only_mask, "Leg Status"].apply(
+            lambda x: append_leg_status(x, "CLOSE_WITHOUT_OPEN")
+        )
+
+        option_mask = df["Symbol"].astype(str).str.contains(" Call| Put", na=False)
+        option_df = df[option_mask]
+
+        if option_df.empty:
+            return df
+
+        for symbol, group in option_df.groupby("Symbol", dropna=False):
+            long_open_qty = group[group["Open Action"] == "Buy Open"]["Open\nQuantity"].fillna(0).sum()
+            long_close_qty = group[group["Close Action"] == "Sell Close"]["Close\nQuantity"].fillna(0).sum()
+            short_open_qty = group[group["Open Action"] == "Sell Open"]["Open\nQuantity"].fillna(0).sum()
+            short_close_qty = group[group["Close Action"] == "Buy Close"]["Close\nQuantity"].fillna(0).sum()
+
+            long_open_only = group[(group["Open Action"] == "Buy Open") & (group["Close Action"].isna())]
+            short_open_only = group[(group["Open Action"] == "Sell Open") & (group["Close Action"].isna())]
+            long_close_rows = group[group["Close Action"] == "Sell Close"]
+            short_close_rows = group[group["Close Action"] == "Buy Close"]
+
+            long_is_unbalanced = abs(float(long_open_qty) - float(long_close_qty)) > 1e-9
+            short_is_unbalanced = abs(float(short_open_qty) - float(short_close_qty)) > 1e-9
+
+            if long_is_unbalanced and (long_open_qty > 0 or long_close_qty > 0):
+                long_idx = group[
+                    (group["Open Action"] == "Buy Open") | (group["Close Action"] == "Sell Close")
+                ].index
+                df.loc[long_idx, "Leg Status"] = df.loc[long_idx, "Leg Status"].apply(
+                    lambda x: append_leg_status(x, "LONG_QTY_MISMATCH")
+                )
+
+            if short_is_unbalanced and (short_open_qty > 0 or short_close_qty > 0):
+                short_idx = group[
+                    (group["Open Action"] == "Sell Open") | (group["Close Action"] == "Buy Close")
+                ].index
+                df.loc[short_idx, "Leg Status"] = df.loc[short_idx, "Leg Status"].apply(
+                    lambda x: append_leg_status(x, "SHORT_QTY_MISMATCH")
+                )
+
+            long_aggregated_close = (
+                len(long_open_only) > 0
+                and len(long_close_rows) > 0
+                and long_close_rows["Close\nQuantity"].fillna(0).max() > 1
+                and abs(float(long_open_qty) - float(long_close_qty)) <= 1e-9
+            )
+            if long_aggregated_close:
+                long_related_idx = group[
+                    (group["Open Action"] == "Buy Open") | (group["Close Action"] == "Sell Close")
+                ].index
+                df.loc[long_related_idx, "Leg Status"] = df.loc[long_related_idx, "Leg Status"].apply(
+                    lambda x: append_leg_status(x, "MULTI_LEG_AGGREGATED_CLOSE")
+                )
+
+                long_close_order_ids = [
+                    oid for oid in long_close_rows["Close Order ID"].dropna().tolist() if str(oid).strip()
+                ]
+                unique_long_close_order_ids = {str(oid) for oid in long_close_order_ids}
+                if len(unique_long_close_order_ids) == 1:
+                    shared_close_order_id = long_close_order_ids[0]
+                    long_open_only_missing_close_id_idx = long_open_only[
+                        long_open_only["Close Order ID"].isna()
+                    ].index
+                    if len(long_open_only_missing_close_id_idx) > 0:
+                        df.loc[long_open_only_missing_close_id_idx, "Close Order ID"] = shared_close_order_id
+
+            short_aggregated_close = (
+                len(short_open_only) > 0
+                and len(short_close_rows) > 0
+                and short_close_rows["Close\nQuantity"].fillna(0).max() > 1
+                and abs(float(short_open_qty) - float(short_close_qty)) <= 1e-9
+            )
+            if short_aggregated_close:
+                short_related_idx = group[
+                    (group["Open Action"] == "Sell Open") | (group["Close Action"] == "Buy Close")
+                ].index
+                df.loc[short_related_idx, "Leg Status"] = df.loc[short_related_idx, "Leg Status"].apply(
+                    lambda x: append_leg_status(x, "MULTI_LEG_AGGREGATED_CLOSE")
+                )
+
+                short_close_order_ids = [
+                    oid for oid in short_close_rows["Close Order ID"].dropna().tolist() if str(oid).strip()
+                ]
+                unique_short_close_order_ids = {str(oid) for oid in short_close_order_ids}
+                if len(unique_short_close_order_ids) == 1:
+                    shared_close_order_id = short_close_order_ids[0]
+                    short_open_only_missing_close_id_idx = short_open_only[
+                        short_open_only["Close Order ID"].isna()
+                    ].index
+                    if len(short_open_only_missing_close_id_idx) > 0:
+                        df.loc[short_open_only_missing_close_id_idx, "Close Order ID"] = shared_close_order_id
+
+        return df
 
     def build_validation_issues(df_all: pd.DataFrame):
         if df_all.empty:
@@ -1098,6 +1343,11 @@ def write_excel_output(combined: list, output_file: str):
                 if pd.isna(candidate_close_date):
                     continue
 
+                # Validation Issues is intended for historical orphan closes.
+                # Keep current-year rows on their primary trade sheet only.
+                if getattr(candidate_close_date, "year", None) is None or int(candidate_close_date.year) >= this_year:
+                    continue
+
                 if expiration_dt is None or expiration_dt.date() >= datetime.date.today():
                     continue
 
@@ -1116,7 +1366,7 @@ def write_excel_output(combined: list, output_file: str):
             return pd.DataFrame(columns=issue_columns)
         return pd.DataFrame(issues, columns=issue_columns)
 
-    for entry_idx, entry in sorted(entries_with_indices, key=lambda item: (item[1]['symbol'], item[1]['epoch'])):
+    for entry_idx, entry in sorted(entries_with_indices, key=lambda item: (item[1]['epoch'], item[0])):
         o = entry['open']
         c = entry['close']
 
@@ -1211,6 +1461,9 @@ def write_excel_output(combined: list, output_file: str):
     # Convert to a DataFrame
     df_raw = pd.DataFrame(rows)
     validation_df_raw = pd.DataFrame(validation_rows)
+
+    df_raw = annotate_leg_status(df_raw)
+    validation_df_raw = annotate_leg_status(validation_df_raw)
     
     # Convert date columns to datetime objects so pandas/openpyxl can handle them as dates
     for col in ["Open Date", "Close Date"]:
@@ -1219,19 +1472,110 @@ def write_excel_output(combined: list, output_file: str):
 
     validation_issues_df = build_validation_issues(validation_df_raw)
 
-    df = df_raw
-    
-    this_year = datetime.datetime.now().year
+    def normalize_for_row_overlap_key(value):
+        if value is None or pd.isna(value):
+            return ""
+        if isinstance(value, (datetime.date, datetime.datetime)):
+            return value.isoformat()
 
+        raw = str(value).strip()
+        if raw == "":
+            return ""
+
+        try:
+            dec = Decimal(raw)
+            if dec == dec.to_integral_value():
+                return str(int(dec))
+            return str(dec.normalize())
+        except Exception:
+            return raw
+
+    def build_row_overlap_key(row: pd.Series):
+        return (
+            normalize_for_row_overlap_key(row.get("Symbol")),
+            normalize_for_row_overlap_key(row.get("Open Date")),
+            normalize_for_row_overlap_key(row.get("Open Action")),
+            normalize_for_row_overlap_key(row.get("Open\nQuantity")),
+            normalize_for_row_overlap_key(row.get("Open Price")),
+            normalize_for_row_overlap_key(row.get("Open Order ID")),
+            normalize_for_row_overlap_key(row.get("Close Date")),
+            normalize_for_row_overlap_key(row.get("Close Action")),
+            normalize_for_row_overlap_key(row.get("Close\nQuantity")),
+            normalize_for_row_overlap_key(row.get("Close Price")),
+            normalize_for_row_overlap_key(row.get("Close Order ID")),
+        )
+
+    validation_overlap_keys = {
+        build_row_overlap_key(row)
+        for _, row in validation_issues_df.iterrows()
+    }
+
+    if validation_overlap_keys:
+        df_raw = df_raw[
+            ~df_raw.apply(lambda row: build_row_overlap_key(row) in validation_overlap_keys, axis=1)
+        ].copy()
+
+    def sort_for_output(df_to_sort: pd.DataFrame) -> pd.DataFrame:
+        if df_to_sort.empty:
+            return df_to_sort
+
+        sorted_df = df_to_sort.copy()
+        sort_close = pd.to_datetime(sorted_df["Close Date"], errors='coerce')
+        sort_open = pd.to_datetime(sorted_df["Open Date"], errors='coerce')
+        sort_symbol = sorted_df["Symbol"].fillna("").astype(str)
+
+        symbol_has_close = sort_close.notna().groupby(sort_symbol).transform('any')
+        symbol_has_open_only = sort_close.isna().groupby(sort_symbol).transform('any')
+        mixed_symbol = symbol_has_close & symbol_has_open_only
+
+        sort_close_order = sort_close.fillna(pd.Timestamp.max)
+        symbol_min_close = sort_close.groupby(sort_symbol).transform('min')
+        sort_close_order = sort_close_order.where(~(mixed_symbol & sort_close.isna()), symbol_min_close)
+        sort_open_only_first = (mixed_symbol & sort_close.isna()).astype(int)
+
+        sorted_df["_sort_close"] = sort_close_order
+        sorted_df["_sort_symbol"] = sort_symbol
+        sorted_df["_sort_open_only_first"] = sort_open_only_first
+        sorted_df["_sort_open"] = sort_open
+
+        sorted_df = sorted_df.sort_values(
+            by=["_sort_close", "_sort_symbol", "_sort_open_only_first", "_sort_open"],
+            ascending=[True, True, False, True],
+            na_position='last'
+        )
+        return sorted_df.drop(columns=["_sort_close", "_sort_symbol", "_sort_open_only_first", "_sort_open"])
+
+    df = sort_for_output(df_raw)
+    validation_issues_df = sort_for_output(validation_issues_df)
+    
     # Partitioning logic - Dynamic years
     # We want sheets for every year present in the data, plus a 'Current or Open' sheet
     all_years = sorted([y for y in df['_close_year'].unique() if pd.notna(y)], reverse=True)
     
     sheets = []
     
+    # For prior-year expired options, suppress stale open-only rows in Current/Open
+    # when the same symbol already has at least one closed row.
+    current_exclude_mask = pd.Series(False, index=df.index)
+    if 'Symbol' in df.columns and 'Close Date' in df.columns:
+        symbol_series = df['Symbol'].fillna('').astype(str).str.strip()
+        expiration_year_series = symbol_series.apply(
+            lambda s: (parse_expiration_date(s).year if parse_expiration_date(s) else None)
+        )
+        expired_prior_year_mask = expiration_year_series.apply(
+            lambda y: pd.notna(y) and int(y) < this_year
+        )
+        close_present_mask = df['Close Date'].notna()
+        symbols_with_closed_expired_prior_year = set(symbol_series[expired_prior_year_mask & close_present_mask])
+        current_exclude_mask = (
+            expired_prior_year_mask
+            & df['Close Date'].isna()
+            & symbol_series.isin(symbols_with_closed_expired_prior_year)
+        )
+
     # Always include 'Current or Open' first (it will be Year 2026 if run in 2026, or trades with no close year)
-    current_trades = df[(~df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
-    current_puts = df[(df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna()))]
+    current_trades = df[(~df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna())) & (~current_exclude_mask)]
+    current_puts = df[(df['_is_sold_put']) & ((df['_close_year'] == this_year) | (df['_close_year'].isna())) & (~current_exclude_mask)]
     
     if not current_trades.empty:
         sheets.append((current_trades, "Trades Current or Open"))
