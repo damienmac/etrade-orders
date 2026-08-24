@@ -1141,6 +1141,145 @@ def write_excel_output(combined: list, output_file: str):
         return None
 
     def build_row_data(symbol, opening, closing, is_sold_put, close_year, strategy_link_id=None, strategy_event=None, assignment_status=None):
+        def safe_float(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        def safe_decimal(value):
+            if value is None:
+                return None
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return None
+
+        open_date = parse_to_datetime(opening.get('date')) if opening else None
+        expiration_dt = parse_expiration_date(symbol)
+        expiration_date = expiration_dt.date() if expiration_dt else None
+
+        open_total_out = safe_float(opening.get('total_out')) if opening else None
+        open_total_in = safe_float(opening.get('total_in')) if opening else None
+        close_total_in = safe_float(closing.get('total_in')) if closing else None
+        close_total_out = safe_float(closing.get('total_out')) if closing else None
+
+        net = None
+        cost_to_exercise = None
+        days_to_expiration = None
+        annualized_roi_percent = None
+        covered_call_annualized_roi_percent = None
+        long_shares_annualized_roi_percent = None
+        long_options_annualized_roi_percent = None
+        long_options_roi_percent = None
+
+        close_date = parse_to_datetime(closing.get('date')) if closing else None
+
+        def annualized_from_holding_period(net_value, capital_base, start_dt, end_dt):
+            if net_value is None or capital_base is None or not start_dt or not end_dt:
+                return None
+            try:
+                days_held = (end_dt.date() - start_dt.date()).days
+            except Exception:
+                return None
+            if days_held <= 0 or capital_base == 0:
+                return None
+            return (net_value / capital_base / days_held) * 365 * 100
+
+        if is_sold_put and opening:
+            net = sum(v if v is not None else 0.0 for v in [open_total_in, open_total_out, close_total_in, close_total_out])
+
+            option_details = parse_option_details(symbol)
+            open_quantity = safe_decimal(opening.get('quantity'))
+            if option_details and open_quantity is not None:
+                try:
+                    cost_to_exercise = float(option_details["strike"] * Decimal("100") * open_quantity)
+                except Exception:
+                    cost_to_exercise = None
+
+            if open_date and expiration_date:
+                try:
+                    days_to_expiration = (expiration_date - open_date.date()).days
+                except Exception:
+                    days_to_expiration = None
+
+            if (
+                cost_to_exercise is not None
+                and cost_to_exercise != 0
+                and days_to_expiration is not None
+                and days_to_expiration > 0
+            ):
+                annualized_roi_percent = (net / cost_to_exercise / days_to_expiration) * 365 * 100
+
+        open_action = opening.get('action') if opening else None
+        close_action = closing.get('action') if closing else None
+        option_details = parse_option_details(symbol)
+
+        if opening and closing and net is None:
+            net = sum(v if v is not None else 0.0 for v in [open_total_in, open_total_out, close_total_in, close_total_out])
+
+        open_capital_base = None
+        if open_total_in is not None or open_total_out is not None:
+            open_capital_base = abs(open_total_in or 0.0) + abs(open_total_out or 0.0)
+
+        is_option_symbol = option_details is not None
+        is_share_symbol = not is_option_symbol
+
+        is_covered_call_like = (
+            is_option_symbol
+            and option_details.get("option_type") == "Call"
+            and open_action == "Sell Open"
+            and close_action == "Buy Close"
+        )
+        if is_covered_call_like:
+            open_quantity = safe_decimal(opening.get('quantity'))
+            covered_call_capital_base = None
+            if option_details and open_quantity is not None:
+                try:
+                    covered_call_capital_base = float(option_details["strike"] * Decimal("100") * open_quantity)
+                except Exception:
+                    covered_call_capital_base = None
+            covered_call_annualized_roi_percent = annualized_from_holding_period(
+                net,
+                covered_call_capital_base,
+                open_date,
+                close_date
+            )
+
+        is_long_shares_trade = (
+            is_share_symbol
+            and open_action == "Buy"
+            and close_action == "Sell"
+        )
+        if is_long_shares_trade:
+            long_shares_annualized_roi_percent = annualized_from_holding_period(
+                net,
+                open_capital_base,
+                open_date,
+                close_date
+            )
+
+        is_long_options_trade = (
+            is_option_symbol
+            and open_action == "Buy Open"
+            and close_action == "Sell Close"
+            and option_details.get("option_type") in {"Call", "Put"}
+        )
+        if is_long_options_trade:
+            if net is not None and open_capital_base not in (None, 0):
+                try:
+                    long_options_roi_percent = (net / open_capital_base) * 100
+                except Exception:
+                    long_options_roi_percent = None
+            long_options_annualized_roi_percent = annualized_from_holding_period(
+                net,
+                open_capital_base,
+                open_date,
+                close_date
+            )
+
         close_price = None
         if closing and closing.get('price') is not None:
             try:
@@ -1156,18 +1295,27 @@ def write_excel_output(combined: list, output_file: str):
 
         return {
             "Symbol": symbol,
-            "Open Date": parse_to_datetime(opening.get('date')) if opening else None,
+            "Open Date": open_date,
+            "Expiration Date": expiration_date,
             "Open Action": opening.get('action') if opening else None,
             "Open\nQuantity": opening.get('quantity') if opening else None,
             "Open Price": float(opening.get('price')) if opening and opening.get('price') is not None else None,
-            "Open Total Out": float(opening.get('total_out')) if opening and opening.get('total_out') is not None else None,
-            "Open Total In": float(opening.get('total_in')) if opening and opening.get('total_in') is not None else None,
-            "Close Date": parse_to_datetime(closing.get('date')) if closing else None,
+            "Open Total Out": open_total_out,
+            "Open Total In": open_total_in,
+            "Close Date": close_date,
             "Close Action": closing.get('action') if closing else None,
             "Close\nQuantity": closing.get('quantity') if closing else None,
             "Close Price": float(closing.get('price')) if closing and closing.get('price') is not None else None,
-            "Close Total In": float(closing.get('total_in')) if closing and closing.get('total_in') is not None else None,
-            "Close Total Out": float(closing.get('total_out')) if closing and closing.get('total_out') is not None else None,
+            "Close Total In": close_total_in,
+            "Close Total Out": close_total_out,
+            "Net": net,
+            "Cost To Exercise": cost_to_exercise,
+            "Days to Expiration": days_to_expiration,
+            "Annualized ROI %": annualized_roi_percent,
+            "Covered Call Annualized ROI %": covered_call_annualized_roi_percent,
+            "Long Shares Annualized ROI %": long_shares_annualized_roi_percent,
+            "Long Options ROI %": long_options_roi_percent,
+            "Long Options Annualized ROI %": long_options_annualized_roi_percent,
             "EXPIRED": "EXPIRED" if (closing and closing.get('is_expired')) or real_zero_close_after_expiration else "",
             "Open Order ID": opening.get('order_id') if opening else None,
             "Close Order ID": closing.get('order_id') if closing else None,
@@ -1604,7 +1752,14 @@ def write_excel_output(combined: list, output_file: str):
                 "Total Trades": 0,
                 "Closed Trades": 0,
                 "Total P/L": 0.0,
-                "Win Rate (Closed)": "N/A"
+                "Win Rate (Closed)": "N/A",
+                "Avg Annualized ROI % (Closed Short Puts)": "N/A",
+                "Avg Covered Call Annualized ROI %": "N/A",
+                "Avg Long Shares Annualized ROI %": "N/A",
+                "Avg Long Options ROI %": "N/A",
+                "Avg Long Options Annualized ROI %": "N/A",
+                "Median Long Options Annualized ROI %": "N/A",
+                "Avg Long Options Annualized ROI % (>=7 Days)": "N/A"
             }
         # P/L = (Open Total In + Open Total Out) + (Close Total In + Close Total Out)
         pl = (df_partition['Open Total Out'].fillna(0) + 
@@ -1625,17 +1780,138 @@ def write_excel_output(combined: list, output_file: str):
             win_rate = f"{(wins / len(closed_trades)) * 100:.2f}%"
         else:
             win_rate = "N/A"
+
+        closed_short_puts = closed_trades[closed_trades['_is_sold_put'] == True]
+        short_put_roi = pd.to_numeric(closed_short_puts['Annualized ROI %'], errors='coerce').dropna()
+        avg_annualized_roi = "N/A"
+        if len(short_put_roi) > 0:
+            avg_annualized_roi = f"{short_put_roi.mean():.2f}%"
+
+        covered_call_roi = pd.to_numeric(closed_trades['Covered Call Annualized ROI %'], errors='coerce').dropna()
+        avg_covered_call_roi = "N/A"
+        if len(covered_call_roi) > 0:
+            avg_covered_call_roi = f"{covered_call_roi.mean():.2f}%"
+
+        long_shares_roi = pd.to_numeric(closed_trades['Long Shares Annualized ROI %'], errors='coerce').dropna()
+        avg_long_shares_roi = "N/A"
+        if len(long_shares_roi) > 0:
+            avg_long_shares_roi = f"{long_shares_roi.mean():.2f}%"
+
+        long_options_roi = pd.to_numeric(closed_trades['Long Options Annualized ROI %'], errors='coerce').dropna()
+        avg_long_options_roi = "N/A"
+        if len(long_options_roi) > 0:
+            avg_long_options_roi = f"{long_options_roi.mean():.2f}%"
+
+        long_options_simple_roi = pd.to_numeric(closed_trades['Long Options ROI %'], errors='coerce').dropna()
+        avg_long_options_simple_roi = "N/A"
+        if len(long_options_simple_roi) > 0:
+            avg_long_options_simple_roi = f"{long_options_simple_roi.mean():.2f}%"
+
+        median_long_options_annualized_roi = "N/A"
+        if len(long_options_roi) > 0:
+            median_long_options_annualized_roi = f"{long_options_roi.median():.2f}%"
+
+        long_options_annualized_for_min_days = pd.to_numeric(closed_trades['Long Options Annualized ROI %'], errors='coerce')
+        open_dates = pd.to_datetime(closed_trades['Open Date'], errors='coerce')
+        close_dates = pd.to_datetime(closed_trades['Close Date'], errors='coerce')
+        days_held_series = (close_dates - open_dates).dt.days
+        min_days_filter = days_held_series >= 7
+        avg_long_options_annualized_min_7_days = "N/A"
+        if min_days_filter.any():
+            eligible_values = long_options_annualized_for_min_days[min_days_filter].dropna()
+            if len(eligible_values) > 0:
+                avg_long_options_annualized_min_7_days = f"{eligible_values.mean():.2f}%"
             
         return {
             "Category": name,
             "Total Trades": count,
             "Closed Trades": len(closed_trades),
             "Total P/L": round(pl, 2),
-            "Win Rate (Closed)": win_rate
+            "Win Rate (Closed)": win_rate,
+            "Avg Annualized ROI % (Closed Short Puts)": avg_annualized_roi,
+            "Avg Covered Call Annualized ROI %": avg_covered_call_roi,
+            "Avg Long Shares Annualized ROI %": avg_long_shares_roi,
+            "Avg Long Options ROI %": avg_long_options_simple_roi,
+            "Avg Long Options Annualized ROI %": avg_long_options_roi,
+            "Median Long Options Annualized ROI %": median_long_options_annualized_roi,
+            "Avg Long Options Annualized ROI % (>=7 Days)": avg_long_options_annualized_min_7_days
         }
 
     summary_data = [calculate_summary(data, name) for data, name in sheets]
-    dashboard_df = pd.DataFrame(summary_data)
+
+    estimated_tax_rate_2026 = 0.25
+
+    estimated_tax_periods_2026 = [
+        {
+            "Period": "Q1",
+            "Income Earned Window": "January 1 – March 31, 2026",
+            "Due Date": "April 15, 2026",
+            "start": datetime.date(2026, 1, 1),
+            "end": datetime.date(2026, 3, 31),
+        },
+        {
+            "Period": "Q2",
+            "Income Earned Window": "April 1 – May 31, 2026",
+            "Due Date": "June 15, 2026",
+            "start": datetime.date(2026, 4, 1),
+            "end": datetime.date(2026, 5, 31),
+        },
+        {
+            "Period": "Q3",
+            "Income Earned Window": "June 1 – August 31, 2026",
+            "Due Date": "September 15, 2026",
+            "start": datetime.date(2026, 6, 1),
+            "end": datetime.date(2026, 8, 31),
+        },
+        {
+            "Period": "Q4",
+            "Income Earned Window": "September 1 – December 31, 2026",
+            "Due Date": "January 15, 2027",
+            "start": datetime.date(2026, 9, 1),
+            "end": datetime.date(2026, 12, 31),
+        },
+    ]
+
+    closed_rows = df[df['Close Date'].notna()].copy()
+    quarter_rows = []
+    for period_def in estimated_tax_periods_2026:
+        period_mask = (
+            (closed_rows['Close Date'] >= period_def["start"])
+            & (closed_rows['Close Date'] <= period_def["end"])
+        )
+        period_df = closed_rows[period_mask]
+        period_income = (
+            period_df['Open Total Out'].fillna(0)
+            + period_df['Open Total In'].fillna(0)
+            + period_df['Close Total In'].fillna(0)
+            + period_df['Close Total Out'].fillna(0)
+        ).sum()
+        taxable_income = max(period_income, 0)
+        estimated_tax_due = taxable_income * estimated_tax_rate_2026
+
+        quarter_rows.append({
+            "Category": "Estimated Taxes 2026",
+            "Total Trades": len(period_df),
+            "Closed Trades": len(period_df),
+            "Total P/L": None,
+            "Win Rate (Closed)": "N/A",
+            "Avg Annualized ROI % (Closed Short Puts)": "N/A",
+            "Avg Covered Call Annualized ROI %": "N/A",
+            "Avg Long Shares Annualized ROI %": "N/A",
+            "Avg Long Options ROI %": "N/A",
+            "Avg Long Options Annualized ROI %": "N/A",
+            "Median Long Options Annualized ROI %": "N/A",
+            "Avg Long Options Annualized ROI % (>=7 Days)": "N/A",
+            "Period": period_def["Period"],
+            "Income Earned Window": period_def["Income Earned Window"],
+            "Due Date": period_def["Due Date"],
+            "Estimated Tax Rate": f"{estimated_tax_rate_2026 * 100:.0f}%",
+            "Income Earned (2026)": round(period_income, 2),
+            "Estimated Tax Due": round(estimated_tax_due, 2),
+        })
+
+    dashboard_data = summary_data + quarter_rows
+    dashboard_df = pd.DataFrame(dashboard_data)
 
     if validation_issues_df.empty:
         validation_summary_df = pd.DataFrame([
@@ -1697,7 +1973,7 @@ def write_excel_output(combined: list, output_file: str):
         # Apply formatting to Dashboard
         worksheet = writer.sheets['Dashboard']
         for col_idx, col_name in enumerate(dashboard_df.columns, 1):
-            if col_name == "Total P/L":
+            if col_name in {"Total P/L", "Income Earned (2026)", "Estimated Tax Due"}:
                 for row_idx in range(2, len(dashboard_df) + 2):
                     cell = worksheet.cell(row=row_idx, column=col_idx)
                     cell.number_format = accounting_format
@@ -1716,7 +1992,7 @@ def write_excel_output(combined: list, output_file: str):
                 cell_value = worksheet.cell(row=row_idx, column=col_idx).value
                 if cell_value:
                     val_str = str(cell_value)
-                    if col_name == "Total P/L":
+                    if col_name in {"Total P/L", "Income Earned (2026)", "Estimated Tax Due"}:
                         val_str = "$#,###,###.00" # wider typical currency length
                     max_length = max(max_length, len(val_str))
             

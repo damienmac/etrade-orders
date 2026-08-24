@@ -494,6 +494,308 @@ class OrdersRegressionsTest(unittest.TestCase):
                     ).any()
                 )
 
+    def test_short_put_sheet_includes_annualized_roi_columns(self):
+        historical_year = datetime.datetime.now().year - 1
+        option_symbol = f"MLTX Oct 17 '{str(historical_year)[-2:]} $22.5 Put"
+        covered_call_symbol = f"AAPL Oct 17 '{str(historical_year)[-2:]} $250 Call"
+        long_option_symbol = f"AAPL Oct 17 '{str(historical_year)[-2:]} $260 Call"
+        combined = [
+            {
+                "symbol": option_symbol,
+                "epoch": 1,
+                "open": {
+                    "symbol": option_symbol,
+                    "date": f"10/07/{historical_year}",
+                    "action": "Sell Open",
+                    "quantity": 1,
+                    "price": Decimal("1.20"),
+                    "total_in": 120,
+                    "total_out": 0,
+                    "order_id": 17617,
+                },
+                "close": {
+                    "symbol": option_symbol,
+                    "date": f"10/10/{historical_year}",
+                    "action": "Buy Close",
+                    "quantity": 1,
+                    "price": Decimal("0.20"),
+                    "total_in": 0,
+                    "total_out": -20,
+                    "order_id": 17617,
+                },
+            },
+            {
+                "symbol": covered_call_symbol,
+                "epoch": 2,
+                "open": {
+                    "symbol": covered_call_symbol,
+                    "date": f"10/01/{historical_year}",
+                    "action": "Sell Open",
+                    "quantity": 1,
+                    "price": Decimal("1.50"),
+                    "total_in": 150,
+                    "total_out": 0,
+                    "order_id": 17618,
+                },
+                "close": {
+                    "symbol": covered_call_symbol,
+                    "date": f"10/11/{historical_year}",
+                    "action": "Buy Close",
+                    "quantity": 1,
+                    "price": Decimal("0.50"),
+                    "total_in": 0,
+                    "total_out": -50,
+                    "order_id": 17618,
+                },
+            },
+            {
+                "symbol": "AAPL",
+                "epoch": 3,
+                "open": {
+                    "symbol": "AAPL",
+                    "date": f"10/01/{historical_year}",
+                    "action": "Buy",
+                    "quantity": 100,
+                    "price": Decimal("100.00"),
+                    "total_in": 0,
+                    "total_out": -10000,
+                    "order_id": 17619,
+                },
+                "close": {
+                    "symbol": "AAPL",
+                    "date": f"10/11/{historical_year}",
+                    "action": "Sell",
+                    "quantity": 100,
+                    "price": Decimal("110.00"),
+                    "total_in": 11000,
+                    "total_out": 0,
+                    "order_id": 17619,
+                },
+            },
+            {
+                "symbol": long_option_symbol,
+                "epoch": 4,
+                "open": {
+                    "symbol": long_option_symbol,
+                    "date": f"10/01/{historical_year}",
+                    "action": "Buy Open",
+                    "quantity": 1,
+                    "price": Decimal("2.00"),
+                    "total_in": 0,
+                    "total_out": -200,
+                    "order_id": 17620,
+                },
+                "close": {
+                    "symbol": long_option_symbol,
+                    "date": f"10/11/{historical_year}",
+                    "action": "Sell Close",
+                    "quantity": 1,
+                    "price": Decimal("3.00"),
+                    "total_in": 300,
+                    "total_out": 0,
+                    "order_id": 17620,
+                },
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_base = os.path.join(temp_dir, "orders_output.csv")
+            write_excel_output(combined, out_base)
+            output_file = os.path.join(temp_dir, f"orders_output_{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx")
+
+            short_puts = pd.read_excel(output_file, sheet_name=f"Short Puts {historical_year}")
+            self.assertIn("Expiration Date", short_puts.columns)
+            self.assertIn("Net", short_puts.columns)
+            self.assertIn("Cost To Exercise", short_puts.columns)
+            self.assertIn("Days to Expiration", short_puts.columns)
+            self.assertIn("Annualized ROI %", short_puts.columns)
+            self.assertIn("Covered Call Annualized ROI %", short_puts.columns)
+            self.assertIn("Long Shares Annualized ROI %", short_puts.columns)
+            self.assertIn("Long Options Annualized ROI %", short_puts.columns)
+
+            row = short_puts.iloc[0]
+            self.assertAlmostEqual(100.0, row["Net"], places=6)
+            self.assertAlmostEqual(2250.0, row["Cost To Exercise"], places=6)
+            self.assertEqual(10, int(row["Days to Expiration"]))
+            self.assertAlmostEqual(162.222222, row["Annualized ROI %"], places=4)
+
+            trades = pd.read_excel(output_file, sheet_name=f"Trades {historical_year}")
+            self.assertIn("Covered Call Annualized ROI %", trades.columns)
+            self.assertIn("Long Shares Annualized ROI %", trades.columns)
+            self.assertIn("Long Options ROI %", trades.columns)
+            self.assertIn("Long Options Annualized ROI %", trades.columns)
+
+            covered_call_row = trades[trades["Symbol"] == covered_call_symbol].iloc[0]
+            self.assertAlmostEqual(14.6, covered_call_row["Covered Call Annualized ROI %"], places=4)
+
+            long_shares_row = trades[trades["Symbol"] == "AAPL"].iloc[0]
+            self.assertAlmostEqual(365.0, long_shares_row["Long Shares Annualized ROI %"], places=4)
+
+            long_options_row = trades[trades["Symbol"] == long_option_symbol].iloc[0]
+            self.assertAlmostEqual(50.0, long_options_row["Long Options ROI %"], places=4)
+            self.assertAlmostEqual(1825.0, long_options_row["Long Options Annualized ROI %"], places=4)
+
+            dashboard = pd.read_excel(output_file, sheet_name="Dashboard")
+            self.assertIn("Avg Annualized ROI % (Closed Short Puts)", dashboard.columns)
+            self.assertIn("Avg Covered Call Annualized ROI %", dashboard.columns)
+            self.assertIn("Avg Long Shares Annualized ROI %", dashboard.columns)
+            self.assertIn("Avg Long Options ROI %", dashboard.columns)
+            self.assertIn("Avg Long Options Annualized ROI %", dashboard.columns)
+            self.assertIn("Median Long Options Annualized ROI %", dashboard.columns)
+            self.assertIn("Avg Long Options Annualized ROI % (>=7 Days)", dashboard.columns)
+            dashboard_row = dashboard[dashboard["Category"] == f"Short Puts {historical_year}"].iloc[0]
+            self.assertEqual("162.22%", dashboard_row["Avg Annualized ROI % (Closed Short Puts)"])
+
+            trades_dashboard_row = dashboard[dashboard["Category"] == f"Trades {historical_year}"].iloc[0]
+            self.assertEqual("14.60%", trades_dashboard_row["Avg Covered Call Annualized ROI %"])
+            self.assertEqual("365.00%", trades_dashboard_row["Avg Long Shares Annualized ROI %"])
+            self.assertEqual("50.00%", trades_dashboard_row["Avg Long Options ROI %"])
+            self.assertEqual("1825.00%", trades_dashboard_row["Avg Long Options Annualized ROI %"])
+            self.assertEqual("1825.00%", trades_dashboard_row["Median Long Options Annualized ROI %"])
+            self.assertEqual("1825.00%", trades_dashboard_row["Avg Long Options Annualized ROI % (>=7 Days)"])
+
+    def test_dashboard_includes_estimated_tax_period_income_for_2026(self):
+        combined = [
+            {
+                "symbol": "AAPL",
+                "epoch": 1,
+                "open": {
+                    "symbol": "AAPL",
+                    "date": "01/02/2026",
+                    "action": "Buy",
+                    "quantity": 1,
+                    "price": Decimal("100.00"),
+                    "total_in": 0,
+                    "total_out": -100,
+                    "order_id": 20001,
+                },
+                "close": {
+                    "symbol": "AAPL",
+                    "date": "03/15/2026",
+                    "action": "Sell",
+                    "quantity": 1,
+                    "price": Decimal("110.00"),
+                    "total_in": 110,
+                    "total_out": 0,
+                    "order_id": 20001,
+                },
+            },
+            {
+                "symbol": "MSFT",
+                "epoch": 2,
+                "open": {
+                    "symbol": "MSFT",
+                    "date": "04/02/2026",
+                    "action": "Buy",
+                    "quantity": 1,
+                    "price": Decimal("100.00"),
+                    "total_in": 0,
+                    "total_out": -100,
+                    "order_id": 20002,
+                },
+                "close": {
+                    "symbol": "MSFT",
+                    "date": "05/20/2026",
+                    "action": "Sell",
+                    "quantity": 1,
+                    "price": Decimal("95.00"),
+                    "total_in": 95,
+                    "total_out": 0,
+                    "order_id": 20002,
+                },
+            },
+            {
+                "symbol": "NVDA",
+                "epoch": 3,
+                "open": {
+                    "symbol": "NVDA",
+                    "date": "06/10/2026",
+                    "action": "Buy",
+                    "quantity": 1,
+                    "price": Decimal("50.00"),
+                    "total_in": 0,
+                    "total_out": -50,
+                    "order_id": 20003,
+                },
+                "close": {
+                    "symbol": "NVDA",
+                    "date": "08/10/2026",
+                    "action": "Sell",
+                    "quantity": 1,
+                    "price": Decimal("70.00"),
+                    "total_in": 70,
+                    "total_out": 0,
+                    "order_id": 20003,
+                },
+            },
+            {
+                "symbol": "TSLA",
+                "epoch": 4,
+                "open": {
+                    "symbol": "TSLA",
+                    "date": "09/05/2026",
+                    "action": "Buy",
+                    "quantity": 1,
+                    "price": Decimal("200.00"),
+                    "total_in": 0,
+                    "total_out": -200,
+                    "order_id": 20004,
+                },
+                "close": {
+                    "symbol": "TSLA",
+                    "date": "12/05/2026",
+                    "action": "Sell",
+                    "quantity": 1,
+                    "price": Decimal("180.00"),
+                    "total_in": 180,
+                    "total_out": 0,
+                    "order_id": 20004,
+                },
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_base = os.path.join(temp_dir, "orders_output.csv")
+            write_excel_output(combined, out_base)
+            output_file = os.path.join(temp_dir, f"orders_output_{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx")
+
+            dashboard = pd.read_excel(output_file, sheet_name="Dashboard")
+            self.assertIn("Period", dashboard.columns)
+            self.assertIn("Income Earned Window", dashboard.columns)
+            self.assertIn("Due Date", dashboard.columns)
+            self.assertIn("Estimated Tax Rate", dashboard.columns)
+            self.assertIn("Income Earned (2026)", dashboard.columns)
+            self.assertIn("Estimated Tax Due", dashboard.columns)
+
+            tax_rows = dashboard[dashboard["Category"] == "Estimated Taxes 2026"].copy()
+            self.assertEqual(4, len(tax_rows))
+
+            by_period = {row["Period"]: row for _, row in tax_rows.iterrows()}
+
+            self.assertEqual("January 1 – March 31, 2026", by_period["Q1"]["Income Earned Window"])
+            self.assertEqual("April 15, 2026", by_period["Q1"]["Due Date"])
+            self.assertEqual("25%", by_period["Q1"]["Estimated Tax Rate"])
+            self.assertAlmostEqual(10.0, float(by_period["Q1"]["Income Earned (2026)"]), places=6)
+            self.assertAlmostEqual(2.5, float(by_period["Q1"]["Estimated Tax Due"]), places=6)
+
+            self.assertEqual("April 1 – May 31, 2026", by_period["Q2"]["Income Earned Window"])
+            self.assertEqual("June 15, 2026", by_period["Q2"]["Due Date"])
+            self.assertEqual("25%", by_period["Q2"]["Estimated Tax Rate"])
+            self.assertAlmostEqual(-5.0, float(by_period["Q2"]["Income Earned (2026)"]), places=6)
+            self.assertAlmostEqual(0.0, float(by_period["Q2"]["Estimated Tax Due"]), places=6)
+
+            self.assertEqual("June 1 – August 31, 2026", by_period["Q3"]["Income Earned Window"])
+            self.assertEqual("September 15, 2026", by_period["Q3"]["Due Date"])
+            self.assertEqual("25%", by_period["Q3"]["Estimated Tax Rate"])
+            self.assertAlmostEqual(20.0, float(by_period["Q3"]["Income Earned (2026)"]), places=6)
+            self.assertAlmostEqual(5.0, float(by_period["Q3"]["Estimated Tax Due"]), places=6)
+
+            self.assertEqual("September 1 – December 31, 2026", by_period["Q4"]["Income Earned Window"])
+            self.assertEqual("January 15, 2027", by_period["Q4"]["Due Date"])
+            self.assertEqual("25%", by_period["Q4"]["Estimated Tax Rate"])
+            self.assertAlmostEqual(-20.0, float(by_period["Q4"]["Income Earned (2026)"]), places=6)
+            self.assertAlmostEqual(0.0, float(by_period["Q4"]["Estimated Tax Due"]), places=6)
+
     def test_validation_sheet_flags_expired_orphan_close(self):
         current_year = datetime.datetime.now().year
         expired_year = current_year - 1

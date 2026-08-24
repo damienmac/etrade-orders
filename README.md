@@ -75,6 +75,7 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 ### Excel Sheet Structure
 - **Dashboard:** High-level summary of performance metrics (Total P/L, Win Rate, Trade Count) for every year and category.
 - **Dashboard Validation Pointer:** Includes a quick row showing total validation issue count and where to review details.
+- **Dashboard Estimated Taxes 2026:** Adds custom period rows (`Q1`–`Q4`) with income windows, due dates, period income, a configurable estimate rate, and an estimated payment amount.
 - **Trades [Year]:** All stock and option trades (except Short Puts) closed in that specific year.
 - **Short Puts [Year]:** Specifically tracks "Sell Open" put options for that year.
 - **Current or Open:** Contains all currently open positions and trades closed in the current calendar year.
@@ -85,6 +86,34 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 - **Total In / Total Out:** Raw cash flow for the leg.
 - **EXPIRED:** Marked "EXPIRED" for synthetic $0 closing records created for worthless options.
 - **Order ID Columns:** Used for robust deduplication when merging historical files.
+- **Net:** `Open Total In + Open Total Out + Close Total In + Close Total Out`.
+- **Cost To Exercise (Short Puts):** `Strike * 100 * Quantity`.
+- **Days to Expiration (Short Puts):** `Expiration Date - Open Date` (calendar days).
+- **Annualized ROI % (Short Puts):** `Net / Cost To Exercise / Days to Expiration * 365 * 100`.
+- **Covered Call Annualized ROI %:** Annualized return for covered-call style matched rows using the strategy-specific capital base used by the tool.
+- **Long Shares Annualized ROI %:** Annualized return for long share trades using entry capital and holding period.
+- **Long Options ROI %:** Non-annualized return for long option trades using entry premium capital.
+- **Long Options Annualized ROI %:** Annualized return for long option trades (`ROI / days held * 365`).
+- **Median Long Options Annualized ROI %:** Median of closed long-option annualized ROI values (less outlier-sensitive than mean).
+- **Avg Long Options Annualized ROI % (>=7 Days):** Average annualized long-option ROI only for trades held at least 7 days.
+
+### Estimated Taxes 2026 (Dashboard)
+- The dashboard includes four custom IRS estimated-tax periods:
+  - `Q1`: January 1 – March 31, 2026 (due April 15, 2026)
+  - `Q2`: April 1 – May 31, 2026 (due June 15, 2026)
+  - `Q3`: June 1 – August 31, 2026 (due September 15, 2026)
+  - `Q4`: September 1 – December 31, 2026 (due January 15, 2027)
+- **Income Earned (2026):** Sum of realized trade net cash for rows closed in the period.
+- **Estimated Tax Rate:** Currently hard-coded to `25%` as a planning assumption.
+- **Estimated Tax Due:** `max(Income Earned (2026), 0) * Estimated Tax Rate`.
+- Note: This is a planning estimate only and not tax advice; safe-harbor calculations may produce different required payments.
+
+### Safe-Harbor Inputs To Gather Later
+To add a safer estimated-tax method, collect these values when available:
+- 2025 `Form 1040` line `24` (Total Tax)
+- Expected 2026 filing status
+- 2026 federal withholding-to-date (and expected year-end withholding)
+- Any large expected non-trading income changes for 2026
 
 ## Troubleshooting
 
