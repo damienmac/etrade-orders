@@ -635,6 +635,15 @@ def apply_corporate_actions(opens: list = None, closes: list = None, trades: lis
             return
             
         for adj in sorted_adjs:
+            adj_date = adj['date']
+            # Ensure we are comparing dates to dates
+            if hasattr(adj_date, 'date'):
+                adj_date = adj_date.date()
+            if hasattr(leg_date, 'date'):
+                val_date = leg_date.date()
+            else:
+                val_date = leg_date
+
             symbol = leg.get('symbol', '')
             ticker = adj['ticker']
             
@@ -643,7 +652,6 @@ def apply_corporate_actions(opens: list = None, closes: list = None, trades: lis
             if adj.get('new_ticker') and adj['new_ticker'].lower() != 'none':
                 target_tickers.add(adj['new_ticker'])
             # Also catch any other new_tickers defined for this ticker in other adjustments
-            # (e.g. if we have a split then a dividend, the dividend applies to the new_ticker too)
             for a in adjustments:
                 if a['ticker'] == ticker and a.get('new_ticker') and a['new_ticker'].lower() != 'none':
                     target_tickers.add(a['new_ticker'])
@@ -651,11 +659,16 @@ def apply_corporate_actions(opens: list = None, closes: list = None, trades: lis
             # Match if the current symbol starts with any of the target tickers
             matches_underlying = any(symbol.startswith(t + " ") for t in target_tickers)
             
+            # Safety: If this is a symbol-changing adjustment and the leg already has the NEW ticker,
+            # and the trade is before the adjustment, we assume it was already processed.
+            is_adj_new_ticker = adj.get('new_ticker') and adj['new_ticker'].lower() != 'none'
+            if is_adj_new_ticker and symbol.startswith(adj['new_ticker'] + " ") and val_date < adj_date:
+                continue
+
             # Handle post-split non-standard options multiplier correction
             # (only for fresh orders where we assume E*TRADE used 100 multiplier)
-            is_adj_new_ticker = adj.get('new_ticker') and adj['new_ticker'].lower() != 'none'
             if is_adj_new_ticker and symbol.startswith(adj['new_ticker'] + " "):
-                if leg_date >= adj['date']:
+                if val_date >= adj_date:
                      target_multiplier = 100 * adj['ratio']
                      if target_multiplier != 100:
                          # Multiplier safety: Only apply if it looks like the raw 100-multiplier calculation
@@ -672,7 +685,7 @@ def apply_corporate_actions(opens: list = None, closes: list = None, trades: lis
                              leg['total_in'] = (Decimal(str(leg['total_in'])) / 100) * target_multiplier
                              leg['total_out'] = (Decimal(str(leg['total_out'])) / 100) * target_multiplier
 
-            if leg_date < adj['date']:
+            if val_date < adj_date:
                 # Option match
                 if matches_underlying and " '" in symbol:
                     opt = parse_option_details(symbol)
@@ -1217,6 +1230,16 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
     #    an open leg already represented by a closed row for the same expired symbol.
     # 2) If the same open leg appears with both a real close and a synthetic close,
     #    keep the real-close row and drop the synthetic duplicate row.
+    # Re-match orphans that might have become matchable after split normalization
+    # (e.g. one leg was already renamed by broker in history, the other was not)
+    matched = [t for t in unique_trades if t.get('open') and t.get('close')]
+    orphan_opens = [t.get('open') for t in unique_trades if t.get('open') and not t.get('close')]
+    orphan_closes = [t.get('close') for t in unique_trades if not t.get('open') and t.get('close')]
+    
+    if orphan_opens and orphan_closes:
+        rematched = match_trades(orphan_opens, orphan_closes)
+        unique_trades = matched + rematched
+
     expired_symbols_with_closed_open_keys = {}
     expired_symbols_open_keys_with_real_close = {}
     expired_prior_year_symbols_closed_open_signatures = {}
