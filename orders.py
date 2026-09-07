@@ -1038,10 +1038,11 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
 
         symbol = str(trade_leg.get('symbol', '')).strip()
         action = str(trade_leg.get('action', '')).strip()
-        quantity = int(trade_leg.get('quantity', 0) or 0)
         price_key = normalize_price_for_key(trade_leg.get('price'))
         date_key = normalize_date_for_key(trade_leg.get('date'))
-        return f"{order_id}|{symbol}|{action}|{quantity}|{price_key}|{date_key}"
+        # Exclude quantity from the order leg key. This allows deduplication to correctly
+        # handle split vs. unsplit legs of the same broker order (e.g., after switching to FIFO).
+        return f"{order_id}|{symbol}|{action}|{price_key}|{date_key}"
 
     # We want to keep track of legs (opens and closes) independently to ensure full deduplication
     seen_order_leg_keys = set()
