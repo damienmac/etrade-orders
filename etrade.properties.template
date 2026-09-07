@@ -25,3 +25,13 @@ account_id = "YOUR_ACCOUNT_ID"
 # Output configuration
 # Uncomment and set this to save output to a file instead of printing to console
 output_file = "orders_output.xlsx"
+
+# Tax Information for Estimated Tax Planning (2026)
+# 2025 total tax from Form 1040, line 24 (used for safe harbor calculation)
+# tax_2025_total_tax = 0.0
+# Expected 2026 filing status (single, mfj, mfs, hoh)
+# tax_2026_filing_status = "single"
+# Federal income tax withheld so far in 2026
+# tax_2026_withholding_to_date = 0.0
+# Estimated tax rate to use for P/L (if safe harbor not met or as secondary metric)
+# tax_2026_estimated_rate = 0.25

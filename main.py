@@ -54,7 +54,8 @@ def main():
         consumer_secret=consumer_secret,
         account_id_key=account_id_key,
         tokens=tokens,
-        output_file=output_file
+        output_file=output_file,
+        tax_props=properties
     )
 
 

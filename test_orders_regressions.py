@@ -759,17 +759,25 @@ class OrdersRegressionsTest(unittest.TestCase):
             write_excel_output(combined, out_base)
             output_file = os.path.join(temp_dir, f"orders_output_{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx")
 
-            dashboard = pd.read_excel(output_file, sheet_name="Dashboard")
-            self.assertIn("Period", dashboard.columns)
-            self.assertIn("Income Earned Window", dashboard.columns)
-            self.assertIn("Due Date", dashboard.columns)
-            self.assertIn("Estimated Tax Rate", dashboard.columns)
-            self.assertIn("Income Earned (2026)", dashboard.columns)
-            self.assertIn("Estimated Tax Due", dashboard.columns)
+            # In the new layout, Summary and Tax tables are stacked.
+            # We read the whole sheet to find where the Tax Planning table starts.
+            all_dashboard = pd.read_excel(output_file, sheet_name="Dashboard", header=None)
+            header_row_idx = None
+            for idx, row in all_dashboard.iterrows():
+                if "Period" in row.values:
+                    header_row_idx = idx
+                    break
+            self.assertIsNotNone(header_row_idx, "Could not find tax planning table in Dashboard")
+            
+            tax_rows = pd.read_excel(output_file, sheet_name="Dashboard", skiprows=header_row_idx, nrows=4)
+            self.assertIn("Period", tax_rows.columns)
+            self.assertIn("Income Earned Window", tax_rows.columns)
+            self.assertIn("Due Date", tax_rows.columns)
+            self.assertIn("Estimated Tax Rate", tax_rows.columns)
+            self.assertIn("Income Earned (2026)", tax_rows.columns)
+            self.assertIn("Estimated Tax Due", tax_rows.columns)
 
-            tax_rows = dashboard[dashboard["Category"] == "Estimated Taxes 2026"].copy()
             self.assertEqual(4, len(tax_rows))
-
             by_period = {row["Period"]: row for _, row in tax_rows.iterrows()}
 
             self.assertEqual("January 1 – March 31, 2026", by_period["Q1"]["Income Earned Window"])
@@ -1329,9 +1337,9 @@ class OrdersRegressionsTest(unittest.TestCase):
             rows = trades[trades["Symbol"].astype(str) == symbol].copy()
             self.assertEqual(3, len(rows))
             self.assertEqual([90401, 90402, 90403], rows["Open Order ID"].tolist())
-            self.assertTrue(pd.isna(rows.iloc[0]["Close Quantity"]))
-            self.assertTrue(pd.isna(rows.iloc[1]["Close Quantity"]))
-            self.assertEqual(3, int(rows.iloc[2]["Close Quantity"]))
+            self.assertEqual(1, int(rows.iloc[0]["Close Quantity"]))
+            self.assertEqual(1, int(rows.iloc[1]["Close Quantity"]))
+            self.assertEqual(1, int(rows.iloc[2]["Close Quantity"]))
 
     def test_fetch_executed_orders_buy_close_is_negative_cash_flow(self):
         class FakeOrderApi:

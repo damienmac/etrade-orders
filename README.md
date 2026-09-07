@@ -42,7 +42,18 @@ Before using this tool, you need to set up your `etrade.properties` file:
    # or: environment = "sandbox"
    # or: use_sandbox = "true"
    ```
-4. (Optional) Configure the output filename:
+4. (Optional) Configure Tax Information (for Estimated Tax Planning):
+   ```
+   # 2025 total tax from Form 1040, line 24 (used for safe harbor calculation)
+   tax_2025_total_tax = 33115.0
+   # Expected 2026 filing status (single, mfj, mfs, hoh)
+   tax_2026_filing_status = "mfj"
+   # Federal income tax withheld so far in 2026
+   tax_2026_withholding_to_date = 31567.57
+   # Estimated tax rate to use for P/L (as secondary metric)
+   tax_2026_estimated_rate = 0.25
+   ```
+5. (Optional) Configure the output filename:
    ```
    output_file = "orders_output.xlsx"
    ```
@@ -75,7 +86,7 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 ### Excel Sheet Structure
 - **Dashboard:** High-level summary of performance metrics (Total P/L, Win Rate, Trade Count) for every year and category.
 - **Dashboard Validation Pointer:** Includes a quick row showing total validation issue count and where to review details.
-- **Dashboard Estimated Taxes 2026:** Adds custom period rows (`Q1`–`Q4`) with income windows, due dates, period income, a configurable estimate rate, and an estimated payment amount.
+- **Dashboard Estimated Taxes 2026:** Adds a dedicated table for 2026 planning with custom period rows (`Q1`–`Q4`) including income windows, due dates, period income, configurable tax rates, and estimated payment amounts.
 - **Trades [Year]:** All stock and option trades (except Short Puts) closed in that specific year.
 - **Short Puts [Year]:** Specifically tracks "Sell Open" put options for that year.
 - **Current or Open:** Contains all currently open positions and trades closed in the current calendar year.
@@ -98,22 +109,18 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
 - **Avg Long Options Annualized ROI % (>=7 Days):** Average annualized long-option ROI only for trades held at least 7 days.
 
 ### Estimated Taxes 2026 (Dashboard)
-- The dashboard includes four custom IRS estimated-tax periods:
+- The dashboard includes a dedicated section for IRS estimated-tax periods:
   - `Q1`: January 1 – March 31, 2026 (due April 15, 2026)
   - `Q2`: April 1 – May 31, 2026 (due June 15, 2026)
   - `Q3`: June 1 – August 31, 2026 (due September 15, 2026)
   - `Q4`: September 1 – December 31, 2026 (due January 15, 2027)
-- **Income Earned (2026):** Sum of realized trade net cash for rows closed in the period.
-- **Estimated Tax Rate:** Currently hard-coded to `25%` as a planning assumption.
-- **Estimated Tax Due:** `max(Income Earned (2026), 0) * Estimated Tax Rate`.
-- Note: This is a planning estimate only and not tax advice; safe-harbor calculations may produce different required payments.
-
-### Safe-Harbor Inputs To Gather Later
-To add a safer estimated-tax method, collect these values when available:
-- 2025 `Form 1040` line `24` (Total Tax)
-- Expected 2026 filing status
-- 2026 federal withholding-to-date (and expected year-end withholding)
-- Any large expected non-trading income changes for 2026
+- **Income Earned:** Sum of realized trade net cash for rows closed in the period.
+- **Estimated Tax (Rate Based):** `max(Income Earned, 0) * tax_2026_estimated_rate`. This is a rough planning metric for your trading income.
+- **Safe Harbor Payment (Est):** Calculated as `max(Quarterly Safe Harbor - Quarterly Withholding, 0)`. 
+  - **Safe Harbor Method:** Uses the IRS penalty protection rule of paying at least 110% of the prior year's total tax (Form 1040, Line 24).
+  - Assumes AGI > $150k for the 110% threshold, common for active traders.
+  - Subtraction assumes federal withholding is spread evenly across the year.
+- **Note:** These are planning estimates only and not professional tax advice. Safe-harbor calculations are intended to help you avoid underpayment penalties.
 
 ## Troubleshooting
 

@@ -3,6 +3,8 @@ import datetime
 import os
 import re
 import logging
+import copy
+from collections import defaultdict, deque
 from decimal import Decimal
 from typing import Tuple
 import pyetrade
@@ -515,53 +517,165 @@ def add_expired_worthless_orders(opens: list, closes: list):
 
 def match_trades(opens: list, closes: list) -> list:
     """
-    Matches opening and closing trades by symbol.
+    Matches opening and closing trades by symbol using FIFO logic with quantity splitting.
 
     :param opens: List of opening trades.
     :param closes: List of closing trades.
     :return: A list of matched trade dictionaries.
     """
-    # I want the oldest first
-    closes.reverse()
-    opens.reverse()
+    # Group by symbol
+    opens_by_symbol = defaultdict(deque)
+    closes_by_symbol = defaultdict(deque)
+
+    # Sort by epoch ascending (oldest first)
+    # Use a default epoch of 0 if missing (common in some test scenarios)
+    sorted_opens = sorted(opens, key=lambda x: x.get('epoch', 0))
+    sorted_closes = sorted(closes, key=lambda x: x.get('epoch', 0))
+
+    for o in sorted_opens:
+        opens_by_symbol[o['symbol']].append(copy.deepcopy(o))
+    for c in sorted_closes:
+        closes_by_symbol[c['symbol']].append(copy.deepcopy(c))
 
     combined = []
-    for closing in closes:
-        matched = False
-        for opening_idx, opening in enumerate(opens):
-            if closing['symbol'] == opening['symbol']:
-                match = {
-                    "symbol": closing['symbol'],  # for sorting
-                    "epoch": closing['epoch'],  # for sorting
-                    "open": opening,
-                    "close": closing
-                }
-                combined.append(match)
-                # print(f"COMBINED1 <-- {match}")
-                matched = True
-                opens.pop(opening_idx)
-                break
-        if not matched:
-            match = {
-                "symbol": closing['symbol'],
-                "epoch": closing['epoch'],
-                "open": None,
-                "close": closing
-            }
-            combined.append(match)
-            # print(f"COMBINED2 <-- {match}")
+    
+    # Get all unique symbols
+    symbols = sorted(list(set(list(opens_by_symbol.keys()) + list(closes_by_symbol.keys()))))
 
-    # see what's left in opens that had no closes
-    for opening in opens:
-        match = {
-            "symbol": opening['symbol'],
-            "epoch": opening['epoch'],
-            "open": opening,
-            "close": None
-        }
-        combined.append(match)
-        # print(f"COMBINED3 <-- {match}")
+    for symbol in symbols:
+        q_opens = opens_by_symbol[symbol]
+        q_closes = closes_by_symbol[symbol]
+
+        while q_opens and q_closes:
+            o = q_opens.popleft()
+            c = q_closes.popleft()
+
+            o_qty_dec = Decimal(str(o['quantity']))
+            c_qty_dec = Decimal(str(c['quantity']))
+            match_qty = min(o_qty_dec, c_qty_dec)
+
+            # Create matched row
+            matched_o = copy.deepcopy(o)
+            matched_c = copy.deepcopy(c)
+            
+            # Prorate totals
+            ratio_o = match_qty / o_qty_dec
+            matched_o['quantity'] = float(match_qty) if isinstance(o['quantity'], float) else int(match_qty)
+            matched_o['total_out'] = Decimal(str(o['total_out'])) * ratio_o
+            matched_o['total_in'] = Decimal(str(o['total_in'])) * ratio_o
+            
+            ratio_c = match_qty / c_qty_dec
+            matched_c['quantity'] = float(match_qty) if isinstance(c['quantity'], float) else int(match_qty)
+            matched_c['total_in'] = Decimal(str(c['total_in'])) * ratio_c
+            matched_c['total_out'] = Decimal(str(c['total_out'])) * ratio_c
+
+            combined.append({
+                "symbol": symbol,
+                "epoch": c.get('epoch', 0), 
+                "open": matched_o,
+                "close": matched_c
+            })
+
+            # Put remainders back
+            if o_qty_dec > match_qty:
+                o['quantity'] = float(o_qty_dec - match_qty) if isinstance(o['quantity'], float) else int(o_qty_dec - match_qty)
+                o['total_out'] = Decimal(str(o['total_out'])) * (1 - ratio_o)
+                o['total_in'] = Decimal(str(o['total_in'])) * (1 - ratio_o)
+                q_opens.appendleft(o)
+            
+            if c_qty_dec > match_qty:
+                c['quantity'] = float(c_qty_dec - match_qty) if isinstance(c['quantity'], float) else int(c_qty_dec - match_qty)
+                c['total_in'] = Decimal(str(c['total_in'])) * (1 - ratio_c)
+                c['total_out'] = Decimal(str(c['total_out'])) * (1 - ratio_c)
+                q_closes.appendleft(c)
+
+        # Remaining opens
+        while q_opens:
+            o = q_opens.popleft()
+            combined.append({
+                "symbol": symbol,
+                "epoch": o.get('epoch', 0),
+                "open": o,
+                "close": None
+            })
+
+        # Remaining closes
+        while q_closes:
+            c = q_closes.popleft()
+            combined.append({
+                "symbol": symbol,
+                "epoch": c.get('epoch', 0),
+                "open": None,
+                "close": c
+            })
+
     return combined
+
+
+def sort_for_output(df_to_sort: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sorts a DataFrame of trades for output, ensuring related legs (like assignments) stay together.
+    """
+    if df_to_sort.empty:
+        return df_to_sort
+
+    sorted_df = df_to_sort.copy()
+    
+    # Pre-calculate essential sort components
+    sort_close = pd.to_datetime(sorted_df["Close Date"], errors='coerce')
+    sort_open = pd.to_datetime(sorted_df["Open Date"], errors='coerce')
+    sort_symbol = sorted_df["Symbol"].fillna("").astype(str)
+    
+    # 1. Effective Close Date logic
+    # For regular trades, we sort by Close Date.
+    # For assigned stock trades, we use the Open Date (assignment date) to group with the option.
+    eff_close = sort_close.copy()
+    if "Strategy Event" in sorted_df.columns:
+        is_assn_stock = sorted_df["Strategy Event"].isin(["ASSIGNMENT TRADE", "ASSIGNMENT BUY", "ASSIGNMENT SELL"])
+        # Use .loc to avoid SettingWithCopy warning
+        eff_close[is_assn_stock] = sort_open[is_assn_stock]
+    
+    # Fill N/A with max timestamp for open trades
+    sort_close_order = eff_close.fillna(pd.Timestamp.max)
+
+    # 2. Mixed Symbol logic (Open legs should follow or precede closed legs of the same symbol)
+    # This keeps multiple legs of a single symbol trade together even if some are open.
+    symbol_has_close = sort_close.notna().groupby(sort_symbol).transform('any')
+    symbol_has_open_only = sort_close.isna().groupby(sort_symbol).transform('any')
+    mixed_symbol = symbol_has_close & symbol_has_open_only
+    
+    # For mixed symbols, use the earliest close date of that symbol for the open legs too
+    symbol_min_close = sort_close.groupby(sort_symbol).transform('min')
+    sort_close_order = sort_close_order.where(~(mixed_symbol & sort_close.isna()), symbol_min_close)
+    sort_open_only_first = (mixed_symbol & sort_close.isna()).astype(int)
+
+    # 3. Strategy Link ID grouping
+    # This specifically handles keeping assignments together.
+    strat_id = pd.Series("", index=sorted_df.index)
+    if "Strategy Link ID" in sorted_df.columns:
+        strat_id = sorted_df["Strategy Link ID"].fillna("").astype(str)
+        
+    # 4. Intra-group priority (Option should come before resulting stock)
+    event_priority = pd.Series(1, index=sorted_df.index)
+    if "Strategy Event" in sorted_df.columns:
+        # Option assignment row priority 0 (first)
+        event_priority[sorted_df["Strategy Event"] == "SHORT PUT"] = 0
+
+    sorted_df["_sort_close"] = sort_close_order
+    sorted_df["_sort_strat"] = strat_id
+    sorted_df["_sort_symbol"] = sort_symbol
+    sorted_df["_sort_open_only_first"] = sort_open_only_first
+    sorted_df["_sort_priority"] = event_priority
+    sorted_df["_sort_open"] = sort_open
+
+    sorted_df = sorted_df.sort_values(
+        by=["_sort_close", "_sort_strat", "_sort_priority", "_sort_symbol", "_sort_open_only_first", "_sort_open"],
+        ascending=[True, True, True, True, False, True],
+        na_position='last'
+    )
+    
+    helper_cols = ["_sort_close", "_sort_strat", "_sort_priority", "_sort_symbol", "_sort_open_only_first", "_sort_open"]
+    return sorted_df.drop(columns=[c for c in helper_cols if c in sorted_df.columns])
 
 
 def format_output(combined: list) -> list:
@@ -1055,7 +1169,7 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
     return reconciled_trades
 
 
-def write_excel_output(combined: list, output_file: str):
+def write_excel_output(combined: list, output_file: str, tax_props: dict = None):
     """
     Writes the matched trades to an Excel file with data divided across multiple sheets.
 
@@ -1564,51 +1678,63 @@ def write_excel_output(combined: list, output_file: str):
 
         if assignment_info and assignment_info.get("status") == "ASSIGNED_LINKED":
             buy_entry_idx = assignment_info.get("buy_entry_idx")
-            linked_buy_entry = None
-            linked_buy_symbol = None
             if buy_entry_idx is not None:
                 linked_buy_entry = combined[buy_entry_idx]
                 linked_buy_open = linked_buy_entry.get("open")
-                linked_buy_close = linked_buy_entry.get("close")
                 linked_buy_symbol = linked_buy_entry.get("symbol")
-                assignment_buy_close_year = (
-                    determine_close_year(linked_buy_close)
-                    or determine_close_year(c)
-                    or determine_close_year(linked_buy_open)
-                )
+                sell_legs = assignment_info.get("sell_legs", [])
 
-                assignment_buy_row = build_row_data(
-                    symbol=linked_buy_symbol,
-                    opening=linked_buy_open,
-                    closing={},
-                    is_sold_put=True,
-                    close_year=assignment_buy_close_year,
-                    strategy_link_id=strategy_link_id,
-                    strategy_event="ASSIGNMENT BUY",
-                    assignment_status="ASSIGNED_LINKED"
-                )
-                rows.append(assignment_buy_row)
-                validation_rows.append(assignment_buy_row.copy())
-
-            for sell_leg in assignment_info.get("sell_legs", []):
-                if not sell_leg:
-                    continue
-                assignment_sell_row = build_row_data(
-                    symbol=sell_leg.get("symbol") or linked_buy_symbol,
-                    opening={},
-                    closing=sell_leg,
-                    is_sold_put=True,
-                    close_year=determine_close_year(sell_leg),
-                    strategy_link_id=strategy_link_id,
-                    strategy_event="ASSIGNMENT SELL",
-                    assignment_status="ASSIGNED_LINKED"
-                )
-                rows.append(assignment_sell_row)
-                validation_rows.append(assignment_sell_row.copy())
+                # We use match_trades FIFO logic to pair the assignment buy with its linked sells.
+                # To bypass symbol grouping, we use a temporary symbol for matching.
+                temp_open = copy.deepcopy(linked_buy_open)
+                temp_open['_orig_symbol'] = linked_buy_symbol
+                temp_open['symbol'] = "MATCH"
+                
+                temp_closes = []
+                for sl in sell_legs:
+                    tc = copy.deepcopy(sl)
+                    tc['_orig_symbol'] = tc.get('symbol') or linked_buy_symbol
+                    tc['symbol'] = "MATCH"
+                    temp_closes.append(tc)
+                
+                assignment_matches = match_trades([temp_open], temp_closes)
+                
+                for am in assignment_matches:
+                    am_o = am.get("open")
+                    am_c = am.get("close")
+                    
+                    row_symbol = (am_o or am_c).get('_orig_symbol')
+                    event = "ASSIGNMENT TRADE"
+                    if not am_c:
+                        event = "ASSIGNMENT BUY"
+                    elif not am_o:
+                        event = "ASSIGNMENT SELL"
+                    
+                    am_close_year = None
+                    if am_c:
+                        am_close_year = determine_close_year(am_c)
+                    if am_close_year is None and c:
+                        am_close_year = determine_close_year(c)
+                    if am_close_year is None and am_o:
+                        am_close_year = determine_close_year(am_o)
+                    
+                    assignment_row = build_row_data(
+                        symbol=row_symbol,
+                        opening=am_o,
+                        closing=am_c or {},
+                        is_sold_put=True,
+                        close_year=am_close_year,
+                        strategy_link_id=strategy_link_id,
+                        strategy_event=event,
+                        assignment_status="ASSIGNED_LINKED"
+                    )
+                    rows.append(assignment_row)
+                    validation_rows.append(assignment_row.copy())
 
     # Convert to a DataFrame
     df_raw = pd.DataFrame(rows)
     validation_df_raw = pd.DataFrame(validation_rows)
+
 
     df_raw = annotate_leg_status(df_raw)
     validation_df_raw = annotate_leg_status(validation_df_raw)
@@ -1662,36 +1788,6 @@ def write_excel_output(combined: list, output_file: str):
         df_raw = df_raw[
             ~df_raw.apply(lambda row: build_row_overlap_key(row) in validation_overlap_keys, axis=1)
         ].copy()
-
-    def sort_for_output(df_to_sort: pd.DataFrame) -> pd.DataFrame:
-        if df_to_sort.empty:
-            return df_to_sort
-
-        sorted_df = df_to_sort.copy()
-        sort_close = pd.to_datetime(sorted_df["Close Date"], errors='coerce')
-        sort_open = pd.to_datetime(sorted_df["Open Date"], errors='coerce')
-        sort_symbol = sorted_df["Symbol"].fillna("").astype(str)
-
-        symbol_has_close = sort_close.notna().groupby(sort_symbol).transform('any')
-        symbol_has_open_only = sort_close.isna().groupby(sort_symbol).transform('any')
-        mixed_symbol = symbol_has_close & symbol_has_open_only
-
-        sort_close_order = sort_close.fillna(pd.Timestamp.max)
-        symbol_min_close = sort_close.groupby(sort_symbol).transform('min')
-        sort_close_order = sort_close_order.where(~(mixed_symbol & sort_close.isna()), symbol_min_close)
-        sort_open_only_first = (mixed_symbol & sort_close.isna()).astype(int)
-
-        sorted_df["_sort_close"] = sort_close_order
-        sorted_df["_sort_symbol"] = sort_symbol
-        sorted_df["_sort_open_only_first"] = sort_open_only_first
-        sorted_df["_sort_open"] = sort_open
-
-        sorted_df = sorted_df.sort_values(
-            by=["_sort_close", "_sort_symbol", "_sort_open_only_first", "_sort_open"],
-            ascending=[True, True, False, True],
-            na_position='last'
-        )
-        return sorted_df.drop(columns=["_sort_close", "_sort_symbol", "_sort_open_only_first", "_sort_open"])
 
     df = sort_for_output(df_raw)
     validation_issues_df = sort_for_output(validation_issues_df)
@@ -1837,9 +1933,35 @@ def write_excel_output(combined: list, output_file: str):
             "Avg Long Options Annualized ROI % (>=7 Days)": avg_long_options_annualized_min_7_days
         }
 
-    summary_data = [calculate_summary(data, name) for data, name in sheets]
+    summary_data = []
+    fixed_sheets = []
+    for data, name in sheets:
+        summary_data.append(calculate_summary(data, name))
+        fixed_sheets.append((data, name))
+    sheets = fixed_sheets
 
+    # --- Estimated Tax Logic 2026 ---
+    # Default assumptions
+    tax_2025_total_tax = 0.0
+    tax_2026_filing_status = "single"
+    tax_2026_withholding_to_date = 0.0
     estimated_tax_rate_2026 = 0.25
+
+    if tax_props:
+        try:
+            tax_2025_total_tax = float(tax_props.get('tax_2025_total_tax', 0.0))
+            tax_2026_filing_status = str(tax_props.get('tax_2026_filing_status', 'single')).lower()
+            tax_2026_withholding_to_date = float(tax_props.get('tax_2026_withholding_to_date', 0.0))
+            estimated_tax_rate_2026 = float(tax_props.get('tax_2026_estimated_rate', 0.25))
+        except (ValueError, TypeError):
+            pass
+
+    # Safe Harbor calculation
+    # For AGI > $150k ($75k MFS), safe harbor is 110% of prior year tax.
+    # Otherwise, it's 100%. We'll assume 110% as the conservative default for traders.
+    safe_harbor_percentage = 1.10
+    total_safe_harbor_required = tax_2025_total_tax * safe_harbor_percentage
+    quarterly_safe_harbor = total_safe_harbor_required / 4.0
 
     estimated_tax_periods_2026 = [
         {
@@ -1889,29 +2011,25 @@ def write_excel_output(combined: list, output_file: str):
         taxable_income = max(period_income, 0)
         estimated_tax_due = taxable_income * estimated_tax_rate_2026
 
+        # Safe Harbor Logic: Recommended = max(Quarterly Safe Harbor - Quarterly Withholding, 0)
+        # Note: We assume withholding is spread evenly across the year for this calculation,
+        # or we could just use it as a global offset. Let's use it as a global offset for now.
+        # But per-quarter is more precise if we know the withholding-to-date.
+        recommended_safe_harbor_payment = max(quarterly_safe_harbor - (tax_2026_withholding_to_date / 4.0), 0)
+
         quarter_rows.append({
-            "Category": "Estimated Taxes 2026",
-            "Total Trades": len(period_df),
-            "Closed Trades": len(period_df),
-            "Total P/L": None,
-            "Win Rate (Closed)": "N/A",
-            "Avg Annualized ROI % (Closed Short Puts)": "N/A",
-            "Avg Covered Call Annualized ROI %": "N/A",
-            "Avg Long Shares Annualized ROI %": "N/A",
-            "Avg Long Options ROI %": "N/A",
-            "Avg Long Options Annualized ROI %": "N/A",
-            "Median Long Options Annualized ROI %": "N/A",
-            "Avg Long Options Annualized ROI % (>=7 Days)": "N/A",
             "Period": period_def["Period"],
             "Income Earned Window": period_def["Income Earned Window"],
             "Due Date": period_def["Due Date"],
-            "Estimated Tax Rate": f"{estimated_tax_rate_2026 * 100:.0f}%",
+            "Trades": len(period_df),
             "Income Earned (2026)": round(period_income, 2),
+            "Estimated Tax Rate": f"{estimated_tax_rate_2026 * 100:.0f}%",
             "Estimated Tax Due": round(estimated_tax_due, 2),
+            "Safe Harbor Payment (Est)": round(recommended_safe_harbor_payment, 2),
         })
 
-    dashboard_data = summary_data + quarter_rows
-    dashboard_df = pd.DataFrame(dashboard_data)
+    summary_df = pd.DataFrame(summary_data)
+    tax_df = pd.DataFrame(quarter_rows)
 
     if validation_issues_df.empty:
         validation_summary_df = pd.DataFrame([
@@ -1966,42 +2084,63 @@ def write_excel_output(combined: list, output_file: str):
 
     accounting_format = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
     date_format = 'mm/dd/yyyy'  # This maps to Excel's Short Date in many locales
-    from openpyxl.styles import Alignment
+    from openpyxl.styles import Alignment, Font
 
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        dashboard_df.to_excel(writer, sheet_name='Dashboard', index=False)
-        # Apply formatting to Dashboard
+        summary_df.to_excel(writer, sheet_name='Dashboard', index=False)
         worksheet = writer.sheets['Dashboard']
-        for col_idx, col_name in enumerate(dashboard_df.columns, 1):
-            if col_name in {"Total P/L", "Income Earned (2026)", "Estimated Tax Due"}:
-                for row_idx in range(2, len(dashboard_df) + 2):
-                    cell = worksheet.cell(row=row_idx, column=col_idx)
-                    cell.number_format = accounting_format
-            
-            # Auto-fit column width
+
+        # Add a gap and a title for the tax table
+        tax_title_row = len(summary_df) + 3
+        worksheet.cell(row=tax_title_row, column=1, value="2026 ESTIMATED TAX PLANNING")
+        worksheet.cell(row=tax_title_row, column=1).font = Font(bold=True)
+
+        tax_df.to_excel(writer, sheet_name='Dashboard', index=False, startrow=tax_title_row)
+        tax_header_row = tax_title_row + 1
+
+        # Formatting Summary table
+        for col_idx, col_name in enumerate(summary_df.columns, 1):
+            if col_name == "Total P/L":
+                for row_idx in range(2, len(summary_df) + 2):
+                    worksheet.cell(row=row_idx, column=col_idx).number_format = accounting_format
+
+            # Auto-wrap headers
+            header_cell = worksheet.cell(row=1, column=col_idx)
+            if header_cell.value and '\n' in str(header_cell.value):
+                header_cell.alignment = Alignment(wrapText=True, horizontal='center', vertical='bottom')
+
+        # Formatting Tax table
+        for col_idx, col_name in enumerate(tax_df.columns, 1):
+            if col_name in {"Income Earned (2026)", "Estimated Tax Due", "Safe Harbor Payment (Est)"}:
+                for row_idx in range(tax_header_row + 1, tax_header_row + 1 + len(tax_df)):
+                    worksheet.cell(row=row_idx, column=col_idx).number_format = accounting_format
+
+            # Auto-wrap headers
+            header_cell = worksheet.cell(row=tax_header_row, column=col_idx)
+            if header_cell.value and '\n' in str(header_cell.value):
+                header_cell.alignment = Alignment(wrapText=True, horizontal='center', vertical='bottom')
+
+        # Auto-fit Dashboard columns
+        num_dashboard_cols = max(len(summary_df.columns), len(tax_df.columns))
+        for col_idx in range(1, num_dashboard_cols + 1):
             max_length = 0
             column_letter = worksheet.cell(row=1, column=col_idx).column_letter
-            # Header length
-            header_lines = str(col_name).split('\n')
-            max_length = max(max_length, max(len(line) for line in header_lines))
-            if len(header_lines) > 1:
-                worksheet.cell(row=1, column=col_idx).alignment = Alignment(wrapText=True, horizontal='center', vertical='bottom')
-
-            # Data length
-            for row_idx in range(2, len(dashboard_df) + 2):
-                cell_value = worksheet.cell(row=row_idx, column=col_idx).value
-                if cell_value:
-                    val_str = str(cell_value)
-                    if col_name in {"Total P/L", "Income Earned (2026)", "Estimated Tax Due"}:
-                        val_str = "$#,###,###.00" # wider typical currency length
+            # Iterate through both tables
+            for row_idx in range(1, tax_header_row + 1 + len(tax_df)):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+                if cell.value:
+                    val_str = str(cell.value)
+                    if cell.alignment.wrapText:
+                        val_str = max(val_str.split('\n'), key=len)
+                    if cell.number_format == accounting_format:
+                        val_str = "$#,###,###.00"
                     max_length = max(max_length, len(val_str))
-            
-            adjusted_width = (max_length + 2)
-            worksheet.column_dimensions[column_letter].width = adjusted_width
+            worksheet.column_dimensions[column_letter].width = max_length + 2
 
         validation_count = len(validation_issues_df)
-        pointer_row = len(dashboard_df) + 3
+        pointer_row = tax_header_row + len(tax_df) + 2
         worksheet.cell(row=pointer_row, column=1, value="Validation Issues")
+        worksheet.cell(row=pointer_row, column=1).font = Font(bold=True)
         worksheet.cell(row=pointer_row, column=2, value=validation_count)
         worksheet.cell(
             row=pointer_row,
@@ -2047,7 +2186,7 @@ def write_excel_output(combined: list, output_file: str):
                         val_str = str(cell_value)
                         if "Date" in col_name:
                             val_str = "MM/DD/YYYY" # typical date length
-                        elif "Price" in col_name or "Total" in col_name:
+                        elif ("Price" in col_name or "Total" in col_name or col_name == "Net") and not isinstance(cell_value, str):
                             val_str = "$#,###.00" # typical currency length
                         
                         max_length = max(max_length, len(val_str))
@@ -2083,7 +2222,7 @@ def write_excel_output(combined: list, output_file: str):
                     val_str = str(cell_value)
                     if "Date" in col_name:
                         val_str = "MM/DD/YYYY"
-                    elif "Price" in col_name or "Total" in col_name:
+                    elif ("Price" in col_name or "Total" in col_name or col_name == "Net") and not isinstance(cell_value, str):
                         val_str = "$#,###.00"
                     max_length = max(max_length, len(val_str))
 
@@ -2108,7 +2247,7 @@ def write_excel_output(combined: list, output_file: str):
     print(f"Excel output saved to {output_file}")
 
 
-def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens: dict, output_file: str = None):
+def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens: dict, output_file: str = None, tax_props: dict = None):
     """
     Main orchestration logic for fetching and processing orders.
 
@@ -2117,6 +2256,7 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
     :param account_id_key: The E*TRADE account ID key.
     :param tokens: A dictionary containing the E*TRADE OAuth tokens.
     :param output_file: Optional path to the output file.
+    :param tax_props: Optional dictionary of properties containing tax parameters.
     """
     etrade_order = pyetrade.order.ETradeOrder(
         consumer_key,
@@ -2153,4 +2293,4 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
     # Merge and deduplicate
     combined = merge_and_deduplicate(old_trades, new_trades)
 
-    write_excel_output(combined, output_file)
+    write_excel_output(combined, output_file, tax_props=tax_props)
