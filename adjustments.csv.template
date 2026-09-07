@@ -1,0 +1,12 @@
+# Corporate Action / Adjustment Configuration Table
+# Format: Ticker,Date (YYYY-MM-DD),Ratio,StrikeAdj
+#
+# Examples:
+# 1. Stock Split (6-for-1):
+#    VUG,2026-04-21,6,0
+# 2. Capital Gains / Dividend (Strike Adjustment of $8.03759):
+#    TECL,2025-12-10,1,8.03759
+#
+# Ticker,Date,Ratio,StrikeAdj
+VUG,2026-04-21,6,0
+TECL,2025-12-10,1,8.03759

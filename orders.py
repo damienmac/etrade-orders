@@ -612,6 +612,105 @@ def match_trades(opens: list, closes: list) -> list:
     return combined
 
 
+def load_adjustments(file_path='adjustments.csv'):
+    """
+    Loads stock splits and strike adjustments from a CSV file.
+    Format: Ticker,Date,Ratio,StrikeAdj
+    """
+    adjustments = []
+    # Fallback to splits.csv for backward compatibility
+    if not os.path.exists(file_path) and os.path.exists('splits.csv'):
+        file_path = 'splits.csv'
+        
+    if not os.path.exists(file_path):
+        return adjustments
+        
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or line.lower().startswith('ticker,date'):
+                    continue
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    ticker = parts[0].strip()
+                    date_str = parts[1].strip()
+                    ratio = Decimal(parts[2].strip()) if parts[2].strip() else Decimal("1.0")
+                    strike_adj = Decimal(parts[3].strip()) if len(parts) >= 4 and parts[3].strip() else Decimal("0.0")
+                    adj_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                    adjustments.append({
+                        'ticker': ticker, 
+                        'date': adj_date, 
+                        'ratio': ratio,
+                        'strike_adj': strike_adj
+                    })
+    except Exception as e:
+        logger.error(f"Error loading adjustments from {file_path}: {e}")
+    return adjustments
+
+
+def apply_corporate_actions(opens: list = None, closes: list = None, trades: list = None, adjustments: list = None):
+    """
+    Adjusts quantities, prices, and symbols for stock splits and other corporate actions.
+    """
+    if not adjustments:
+        return
+
+    def process_leg(leg):
+        if not leg:
+            return
+        symbol = leg.get('symbol', '')
+        leg_date = get_leg_date(leg)
+        if not leg_date:
+            return
+            
+        for adj in adjustments:
+            if leg_date < adj['date']:
+                # Option match
+                if symbol.startswith(adj['ticker'] + " "):
+                    opt = parse_option_details(symbol)
+                    if opt and opt['ticker'] == adj['ticker']:
+                        # Adjust quantity (ratio)
+                        if adj['ratio'] != 1:
+                            leg['quantity'] = int(Decimal(str(leg['quantity'])) * adj['ratio'])
+                            # Adjust price (ratio)
+                            leg['price'] = Decimal(str(leg['price'])) / adj['ratio']
+                        
+                        # Adjust strike (ratio and absolute)
+                        new_strike = opt['strike']
+                        if adj['ratio'] != 1:
+                            new_strike = new_strike / adj['ratio']
+                        if adj['strike_adj'] != 0:
+                            new_strike = new_strike - adj['strike_adj']
+                            
+                        new_strike = round(new_strike, 2)
+                        strike_str = f"{new_strike:g}"
+                        
+                        # Rebuild symbol
+                        leg['symbol'] = re.sub(r"\$\d+(?:\.\d+)?", f"${strike_str}", symbol)
+                
+                # Stock match
+                elif symbol == adj['ticker'] or symbol.startswith(adj['ticker'] + " ("):
+                    if adj['ratio'] != 1:
+                        leg['quantity'] = int(Decimal(str(leg['quantity'])) * adj['ratio'])
+                        leg['price'] = Decimal(str(leg['price'])) / adj['ratio']
+
+    if opens:
+        for leg in opens:
+            process_leg(leg)
+    if closes:
+        for leg in closes:
+            process_leg(leg)
+    if trades:
+        for t in trades:
+            process_leg(t.get('open'))
+            process_leg(t.get('close'))
+            if t.get('open'):
+                t['symbol'] = t['open']['symbol']
+            elif t.get('close'):
+                t['symbol'] = t['close']['symbol']
+
+
 def sort_for_output(df_to_sort: pd.DataFrame) -> pd.DataFrame:
     """
     Sorts a DataFrame of trades for output, ensuring related legs (like assignments) stay together.
@@ -2284,12 +2383,17 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
             print(f"Error fetching orders from E*TRADE: {e}")
         return
 
+    adjustments = load_adjustments()
+    apply_corporate_actions(opens=opens, closes=closes, adjustments=adjustments)
+
     add_expired_worthless_orders(opens, closes)
 
     new_trades = match_trades(opens, closes)
     
     # Bring forward historical trades from previous output
     old_trades = load_previous_output(output_file)
+    
+    apply_corporate_actions(trades=old_trades, adjustments=adjustments)
     
     # Merge and deduplicate
     combined = merge_and_deduplicate(old_trades, new_trades)

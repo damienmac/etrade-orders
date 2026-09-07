@@ -122,6 +122,27 @@ The E*TRADE API requires OAuth tokens that typically expire every 24 hours:
   - Subtraction assumes federal withholding is spread evenly across the year.
 - **Note:** These are planning estimates only and not professional tax advice. Safe-harbor calculations are intended to help you avoid underpayment penalties.
 
+## Stock Splits and Corporate Actions
+
+The tool handles stock splits and other contract adjustments (like capital gains distributions) using a configuration file. This ensures that opening trades placed before an adjustment correctly match with closing trades placed after it.
+
+### Configuration
+1. Create a file named `adjustments.csv` (or copy `adjustments.csv.template`).
+2. Add entries for each corporate action in the following format:
+   `Ticker,Date (YYYY-MM-DD),Ratio,StrikeAdj`
+   - **Ticker:** The stock symbol.
+   - **Date:** The ex-date of the split or adjustment.
+   - **Ratio:** The split ratio (e.g., `6` for a 6-for-1 split). Use `1` if there was no quantity change.
+   - **StrikeAdj:** The absolute amount subtracted from the strike price (e.g., `8.03759` for TECL). Use `0` if there was no absolute adjustment.
+
+### Examples:
+- **Stock Split (6-for-1 for VUG on 2026-04-21):**
+  `VUG,2026-04-21,6,0`
+- **Capital Gains Strike Adjustment ($8.03759 for TECL on 2025-12-10):**
+  `TECL,2025-12-10,1,8.03759`
+
+The tool automatically normalizes quantities, strike prices, and symbols for all trades occurring before the specified date, allowing the FIFO matching engine to pair them seamlessly with post-adjustment data.
+
 ## Troubleshooting
 
 - **401 Unauthorized Error:** Your tokens have expired. Run `python tokens.py` again.
