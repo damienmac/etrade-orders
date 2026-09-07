@@ -1,12 +1,25 @@
 # Corporate Action / Adjustment Configuration Table
-# Format: Ticker,Date (YYYY-MM-DD),Ratio,StrikeAdj
+# Format: Ticker,Date (YYYY-MM-DD),Ratio,StrikeAdj,NewTicker
 #
 # Examples:
 # 1. Stock Split (6-for-1):
 #    VUG,2026-04-21,6,0
-# 2. Capital Gains / Dividend (Strike Adjustment of $8.03759):
+# 2. Fractional Split (3-for-2):
+#    XYZ,2026-05-15,3:2,0
+# 3. Capital Gains / Dividend (Strike Adjustment of $8.03759):
 #    TECL,2025-12-10,1,8.03759
+# 4. Reverse Split with Symbol Change (1-for-10, TLRY -> TLRY1):
+#    TLRY,2025-12-02,0.1,0,TLRY1
+# 5. Spin-off with Symbol Change (LEN -> LEN1):
+#    LEN,2025-01-21,1,0,LEN1
+# 6. Reverse Split with Multiple Adjustments (BITI):
+#    BITI,2024-11-07,0.2,0,BITI1
+#    BITI,2026-07-01,1,1.448766
 #
-# Ticker,Date,Ratio,StrikeAdj
+# Ticker,Date,Ratio,StrikeAdj,NewTicker
 VUG,2026-04-21,6,0
 TECL,2025-12-10,1,8.03759
+TLRY,2025-12-02,0.1,0,TLRY1
+LEN,2025-01-21,1,0,LEN1
+BITI,2024-11-07,0.2,0,BITI1
+BITI,2026-07-01,1,1.448766

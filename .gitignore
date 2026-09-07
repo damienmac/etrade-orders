@@ -7,3 +7,8 @@ orders_output_*.xlsm
 ~$orders_output_*.xlsx
 .idea
 __pycache*
+venv/
+.pytest_cache/
+bad/
+support1.md
+adjustments.csv

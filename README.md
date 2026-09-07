@@ -129,17 +129,20 @@ The tool handles stock splits and other contract adjustments (like capital gains
 ### Configuration
 1. Create a file named `adjustments.csv` (or copy `adjustments.csv.template`).
 2. Add entries for each corporate action in the following format:
-   `Ticker,Date (YYYY-MM-DD),Ratio,StrikeAdj`
+   `Ticker,Date (YYYY-MM-DD),Ratio,StrikeAdj,NewTicker`
    - **Ticker:** The stock symbol.
    - **Date:** The ex-date of the split or adjustment.
-   - **Ratio:** The split ratio (e.g., `6` for a 6-for-1 split). Use `1` if there was no quantity change.
-   - **StrikeAdj:** The absolute amount subtracted from the strike price (e.g., `8.03759` for TECL). Use `0` if there was no absolute adjustment.
+   - **Ratio:** The split ratio (e.g., `6` for a 6-for-1 split, `0.1` or `1:10` for a 1-for-10 reverse split).
+   - **StrikeAdj:** The absolute amount subtracted from the strike price. Use `0` if not applicable.
+   - **NewTicker:** (Optional) The new symbol for non-standard adjusted options (e.g., `TLRY1`).
 
 ### Examples:
 - **Stock Split (6-for-1 for VUG on 2026-04-21):**
   `VUG,2026-04-21,6,0`
 - **Capital Gains Strike Adjustment ($8.03759 for TECL on 2025-12-10):**
   `TECL,2025-12-10,1,8.03759`
+- **Reverse Split with Symbol Change (1-for-10 for TLRY on 2025-12-02):**
+  `TLRY,2025-12-02,0.1,0,TLRY1`
 
 The tool automatically normalizes quantities, strike prices, and symbols for all trades occurring before the specified date, allowing the FIFO matching engine to pair them seamlessly with post-adjustment data.
 

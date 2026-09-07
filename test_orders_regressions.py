@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pandas as pd
 
-from orders import add_expired_worthless_orders, fetch_executed_orders, link_short_put_assignments, load_previous_output, match_trades, merge_and_deduplicate, parse_mmddyyyy, write_excel_output
+from orders import report_unmatched_expired_trades, fetch_executed_orders, link_short_put_assignments, load_previous_output, match_trades, merge_and_deduplicate, parse_mmddyyyy, write_excel_output
 
 
 class OrdersRegressionsTest(unittest.TestCase):
@@ -1108,6 +1108,8 @@ class OrdersRegressionsTest(unittest.TestCase):
                 "action": "Buy Open",
                 "quantity": 1,
                 "price": Decimal("1.00"),
+                "total_in": Decimal("0.00"),
+                "total_out": Decimal("100.00"),
                 "order_id": 90101,
             },
             {
@@ -1117,6 +1119,8 @@ class OrdersRegressionsTest(unittest.TestCase):
                 "action": "Buy Open",
                 "quantity": 1,
                 "price": Decimal("1.10"),
+                "total_in": Decimal("0.00"),
+                "total_out": Decimal("110.00"),
                 "order_id": 90102,
             },
             {
@@ -1126,6 +1130,8 @@ class OrdersRegressionsTest(unittest.TestCase):
                 "action": "Buy Open",
                 "quantity": 1,
                 "price": Decimal("1.20"),
+                "total_in": Decimal("0.00"),
+                "total_out": Decimal("120.00"),
                 "order_id": 90103,
             },
         ]
@@ -1137,13 +1143,16 @@ class OrdersRegressionsTest(unittest.TestCase):
                 "action": "Sell Close",
                 "quantity": 3,
                 "price": Decimal("2.00"),
+                "total_in": Decimal("600.00"),
+                "total_out": Decimal("0.00"),
                 "order_id": 90201,
             }
         ]
 
-        add_expired_worthless_orders(opens, closes)
+        combined = match_trades(opens, closes)
+        report_unmatched_expired_trades(combined)
 
-        synthetic = [c for c in closes if str(c.get("order_id", "")).startswith("SYNTH-")]
+        synthetic = [t for t in combined if t.get('close') and str(t['close'].get("order_id", "")).startswith("SYNTH-")]
         self.assertEqual([], synthetic)
 
     def test_synthetic_buy_close_logs_error(self):
@@ -1156,20 +1165,23 @@ class OrdersRegressionsTest(unittest.TestCase):
                 "action": "Sell Open",
                 "quantity": 1,
                 "price": Decimal("1.00"),
+                "total_in": Decimal("100.00"),
+                "total_out": Decimal("0.00"),
                 "order_id": 90301,
             }
         ]
         closes = []
 
-        with self.assertLogs("orders", level="ERROR") as logs:
-            add_expired_worthless_orders(opens, closes)
+        combined = match_trades(opens, closes)
+        with self.assertLogs("orders", level="WARNING") as logs:
+            report_unmatched_expired_trades(combined)
 
         synthetic_buy_closes = [
-            c for c in closes
-            if c.get("action") == "Buy Close" and str(c.get("order_id", "")).startswith("SYNTH-")
+            t for t in combined
+            if t.get('close') and t['close'].get("action") == "Buy Close" and str(t['close'].get("order_id", "")).startswith("SYNTH-")
         ]
-        self.assertEqual(1, len(synthetic_buy_closes))
-        self.assertTrue(any("Synthetic Buy Close created" in message for message in logs.output))
+        self.assertEqual(0, len(synthetic_buy_closes))
+        self.assertTrue(any("UNMATCHED EXPIRED OPTIONS FOUND" in message for message in logs.output))
 
     def test_synthetic_sell_close_logs_error(self):
         expired_symbol = "NVDA Jun 05 '20 $220 Call"
@@ -1181,20 +1193,23 @@ class OrdersRegressionsTest(unittest.TestCase):
                 "action": "Buy Open",
                 "quantity": 1,
                 "price": Decimal("1.00"),
+                "total_in": Decimal("0.00"),
+                "total_out": Decimal("100.00"),
                 "order_id": 90351,
             }
         ]
         closes = []
 
-        with self.assertLogs("orders", level="ERROR") as logs:
-            add_expired_worthless_orders(opens, closes)
+        combined = match_trades(opens, closes)
+        with self.assertLogs("orders", level="WARNING") as logs:
+            report_unmatched_expired_trades(combined)
 
         synthetic_sell_closes = [
-            c for c in closes
-            if c.get("action") == "Sell Close" and str(c.get("order_id", "")).startswith("SYNTH-")
+            t for t in combined
+            if t.get('close') and t['close'].get("action") == "Sell Close" and str(t['close'].get("order_id", "")).startswith("SYNTH-")
         ]
-        self.assertEqual(1, len(synthetic_sell_closes))
-        self.assertTrue(any("Synthetic Sell Close created" in message for message in logs.output))
+        self.assertEqual(0, len(synthetic_sell_closes))
+        self.assertTrue(any("UNMATCHED EXPIRED OPTIONS FOUND" in message for message in logs.output))
 
     def test_leg_status_marks_multi_open_with_aggregated_close(self):
         current_year = datetime.datetime.now().year

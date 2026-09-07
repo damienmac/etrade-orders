@@ -437,82 +437,36 @@ def link_short_put_assignments(combined: list) -> dict:
     return assignment_links
 
 
-def add_expired_worthless_orders(opens: list, closes: list):
-    """Adds synthetic closing orders for options that expired worthless."""
+def report_unmatched_expired_trades(combined_trades: list):
+    """Reports unmatched expired options to the console to help user identify missing adjustments."""
     now = datetime.datetime.now()
-
-    opens_by_symbol = {}
-    for opening in opens:
-        symbol = opening.get('symbol')
-        if not symbol:
-            continue
-        opens_by_symbol.setdefault(symbol, []).append(opening)
-
-    for symbol, symbol_opens in opens_by_symbol.items():
-        exp_date = parse_expiration_date(symbol)
-        if not exp_date or exp_date >= now:
-            continue
-
-        long_opens = [o for o in symbol_opens if o.get('action') == "Buy Open"]
-        short_opens = [o for o in symbol_opens if o.get('action') == "Sell Open"]
-
-        total_long_open_qty = sum(int(o.get('quantity', 0) or 0) for o in long_opens)
-        total_short_open_qty = sum(int(o.get('quantity', 0) or 0) for o in short_opens)
-
-        total_sell_close_qty = sum(
-            int(c.get('quantity', 0) or 0)
-            for c in closes
-            if c.get('symbol') == symbol and c.get('action') == "Sell Close"
-        )
-        total_buy_close_qty = sum(
-            int(c.get('quantity', 0) or 0)
-            for c in closes
-            if c.get('symbol') == symbol and c.get('action') == "Buy Close"
-        )
-
-        long_unmatched_qty = max(0, total_long_open_qty - total_sell_close_qty)
-        short_unmatched_qty = max(0, total_short_open_qty - total_buy_close_qty)
-
-        # E*TRADE timestamps are in milliseconds.
-        epoch = int(exp_date.timestamp() * 1000)
-
-        def append_synthetics_from_opens(open_legs, close_action, unmatched_qty):
-            remaining = unmatched_qty
-            synth_index = 1
-            for opening in open_legs:
-                if remaining <= 0:
-                    break
-                open_qty = int(opening.get('quantity', 0) or 0)
-                if open_qty <= 0:
-                    continue
-                synth_qty = min(open_qty, remaining)
-                synthetic_id = f"SYNTH-{symbol}-{exp_date.strftime('%Y%m%d')}-{close_action}-{synth_index}"
-                synth_index += 1
-                synthetic_close = {
-                    "symbol": symbol,
-                    "date": exp_date.strftime("%m/%d/%Y"),
-                    "epoch": epoch,
-                    "action": close_action,
-                    "quantity": synth_qty,
-                    "price": Decimal("0.00"),
-                    "total_in": 0,
-                    "total_out": 0,
-                    "is_expired": True,
-                    "order_id": synthetic_id,
-                }
-                closes.append(synthetic_close)
-                if close_action in ("Buy Close", "Sell Close"):
-                    logger.error(
-                        "Synthetic %s created for expired option %s (qty=%s, open_order_id=%s)",
-                        close_action,
-                        symbol,
-                        synth_qty,
-                        opening.get("order_id"),
-                    )
-                remaining -= synth_qty
-
-        append_synthetics_from_opens(long_opens, "Sell Close", long_unmatched_qty)
-        append_synthetics_from_opens(short_opens, "Buy Close", short_unmatched_qty)
+    found_any = False
+    
+    for trade in combined_trades:
+        o = trade.get('open')
+        c = trade.get('close')
+        symbol = trade.get('symbol')
+        
+        # Only interested in unmatched opens
+        if o and not c:
+            exp_date = parse_expiration_date(symbol)
+            if exp_date and exp_date < now:
+                if not found_any:
+                    msg = "\nWARNING: UNMATCHED EXPIRED OPTIONS FOUND\n" \
+                          "These options have passed their expiration date but have no matching closing order.\n" \
+                          "This often indicates a missing corporate action in adjustments.csv (e.g., stock split or symbol change)."
+                    print(msg)
+                    logger.warning(msg)
+                    found_any = True
+                
+                line = f"  - {symbol} (Qty: {o.get('quantity')}, Open Date: {o.get('date')}, Order ID: {o.get('order_id')})"
+                print(line)
+                logger.warning(line)
+    
+    if found_any:
+        footer = "Please check your E*TRADE history and update adjustments.csv if a corporate action occurred.\n"
+        print(footer)
+        logger.warning(footer)
 
 
 def match_trades(opens: list, closes: list) -> list:
@@ -615,7 +569,7 @@ def match_trades(opens: list, closes: list) -> list:
 def load_adjustments(file_path='adjustments.csv'):
     """
     Loads stock splits and strike adjustments from a CSV file.
-    Format: Ticker,Date,Ratio,StrikeAdj
+    Format: Ticker,Date,Ratio,StrikeAdj,NewTicker
     """
     adjustments = []
     # Fallback to splits.csv for backward compatibility
@@ -635,14 +589,27 @@ def load_adjustments(file_path='adjustments.csv'):
                 if len(parts) >= 3:
                     ticker = parts[0].strip()
                     date_str = parts[1].strip()
-                    ratio = Decimal(parts[2].strip()) if parts[2].strip() else Decimal("1.0")
+                    
+                    # Handle fractional ratios like 3:2
+                    ratio_str = parts[2].strip()
+                    if ratio_str and ':' in ratio_str:
+                        ratio_parts = ratio_str.split(':')
+                        if len(ratio_parts) == 2:
+                            ratio = Decimal(ratio_parts[0].strip()) / Decimal(ratio_parts[1].strip())
+                        else:
+                            ratio = Decimal(ratio_str)
+                    else:
+                        ratio = Decimal(ratio_str) if ratio_str else Decimal("1.0")
+
                     strike_adj = Decimal(parts[3].strip()) if len(parts) >= 4 and parts[3].strip() else Decimal("0.0")
+                    new_ticker = parts[4].strip() if len(parts) >= 5 and parts[4].strip() else None
                     adj_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
                     adjustments.append({
                         'ticker': ticker, 
                         'date': adj_date, 
                         'ratio': ratio,
-                        'strike_adj': strike_adj
+                        'strike_adj': strike_adj,
+                        'new_ticker': new_ticker
                     })
     except Exception as e:
         logger.error(f"Error loading adjustments from {file_path}: {e}")
@@ -656,41 +623,90 @@ def apply_corporate_actions(opens: list = None, closes: list = None, trades: lis
     if not adjustments:
         return
 
+    # Sort adjustments chronologically to ensure multiple adjustments are applied in order
+    sorted_adjs = sorted(adjustments, key=lambda x: x['date'])
+
     def process_leg(leg):
         if not leg:
             return
-        symbol = leg.get('symbol', '')
+        
         leg_date = get_leg_date(leg)
         if not leg_date:
             return
             
-        for adj in adjustments:
+        for adj in sorted_adjs:
+            symbol = leg.get('symbol', '')
+            ticker = adj['ticker']
+            
+            # Find all tickers that might refer to this underlying (standard and non-standard)
+            target_tickers = {ticker}
+            if adj.get('new_ticker') and adj['new_ticker'].lower() != 'none':
+                target_tickers.add(adj['new_ticker'])
+            # Also catch any other new_tickers defined for this ticker in other adjustments
+            # (e.g. if we have a split then a dividend, the dividend applies to the new_ticker too)
+            for a in adjustments:
+                if a['ticker'] == ticker and a.get('new_ticker') and a['new_ticker'].lower() != 'none':
+                    target_tickers.add(a['new_ticker'])
+
+            # Match if the current symbol starts with any of the target tickers
+            matches_underlying = any(symbol.startswith(t + " ") for t in target_tickers)
+            
+            # Handle post-split non-standard options multiplier correction
+            # (only for fresh orders where we assume E*TRADE used 100 multiplier)
+            is_adj_new_ticker = adj.get('new_ticker') and adj['new_ticker'].lower() != 'none'
+            if is_adj_new_ticker and symbol.startswith(adj['new_ticker'] + " "):
+                if leg_date >= adj['date']:
+                     target_multiplier = 100 * adj['ratio']
+                     if target_multiplier != 100:
+                         # Multiplier safety: Only apply if it looks like the raw 100-multiplier calculation
+                         # This prevents double-correcting trades loaded from history.
+                         price = Decimal(str(leg.get('price', '0')))
+                         qty = Decimal(str(leg.get('quantity', '0')))
+                         raw_val = abs(price * 100 * qty)
+                         
+                         total_in = abs(Decimal(str(leg.get('total_in', '0'))))
+                         total_out = abs(Decimal(str(leg.get('total_out', '0'))))
+                         
+                         if (total_in > 0 and abs(total_in - raw_val) < 0.001) or \
+                            (total_out > 0 and abs(total_out - raw_val) < 0.001):
+                             leg['total_in'] = (Decimal(str(leg['total_in'])) / 100) * target_multiplier
+                             leg['total_out'] = (Decimal(str(leg['total_out'])) / 100) * target_multiplier
+
             if leg_date < adj['date']:
                 # Option match
-                if symbol.startswith(adj['ticker'] + " "):
+                if matches_underlying and " '" in symbol:
                     opt = parse_option_details(symbol)
-                    if opt and opt['ticker'] == adj['ticker']:
+                    # Match if the option ticker matches any of our target tickers
+                    if opt and opt['ticker'] in target_tickers:
+                        # Non-standard adjustment: Symbol change (like TLRY1)
+                        is_non_standard = is_adj_new_ticker
+
                         # Adjust quantity (ratio)
-                        if adj['ratio'] != 1:
+                        if adj['ratio'] != 1 and not is_non_standard:
                             leg['quantity'] = int(Decimal(str(leg['quantity'])) * adj['ratio'])
                             # Adjust price (ratio)
                             leg['price'] = Decimal(str(leg['price'])) / adj['ratio']
                         
                         # Adjust strike (ratio and absolute)
                         new_strike = opt['strike']
-                        if adj['ratio'] != 1:
+                        if adj['ratio'] != 1 and not is_non_standard:
                             new_strike = new_strike / adj['ratio']
                         if adj['strike_adj'] != 0:
                             new_strike = new_strike - adj['strike_adj']
                             
                         new_strike = round(new_strike, 2)
-                        strike_str = f"{new_strike:g}"
+                        strike_str = "{:f}".format(new_strike.normalize())
                         
                         # Rebuild symbol
-                        leg['symbol'] = re.sub(r"\$\d+(?:\.\d+)?", f"${strike_str}", symbol)
+                        new_symbol = re.sub(r"\$\d+(?:\.\d+)?", f"${strike_str}", symbol)
+                        if is_non_standard:
+                            # Replace the ticker in the symbol if it hasn't been replaced yet
+                            if adj['ticker'] + " " in new_symbol and adj['new_ticker'] + " " not in new_symbol:
+                                new_symbol = new_symbol.replace(adj['ticker'] + " ", adj['new_ticker'] + " ", 1)
+                        leg['symbol'] = new_symbol
                 
                 # Stock match
-                elif symbol == adj['ticker'] or symbol.startswith(adj['ticker'] + " ("):
+                elif symbol == ticker or symbol.startswith(ticker + " ("):
                     if adj['ratio'] != 1:
                         leg['quantity'] = int(Decimal(str(leg['quantity'])) * adj['ratio'])
                         leg['price'] = Decimal(str(leg['price'])) / adj['ratio']
@@ -1682,46 +1698,61 @@ def write_excel_output(combined: list, output_file: str, tax_props: dict = None)
             ]["Close\nQuantity"].fillna(0).sum()
 
             unmatched_close_qty = int(max(0, close_qty_total - open_qty_total))
-            if unmatched_close_qty <= 0:
-                continue
-
-            close_only_rows = group[
-                group["Close Action"].isin(["Buy Close", "Sell Close"])
-                & group["Open Action"].isna()
-                & group["Close\nQuantity"].fillna(0).gt(0)
-            ].copy()
-
-            if close_only_rows.empty:
-                continue
-
-            close_only_rows = close_only_rows.sort_values(by=["Close Date", "Close\nQuantity"], ascending=[True, False])
+            unmatched_open_qty = int(max(0, open_qty_total - close_qty_total))
+            
             expiration_dt = parse_expiration_date(str(symbol))
+            is_expired = expiration_dt is not None and expiration_dt.date() < datetime.date.today()
 
-            for _, candidate in close_only_rows.iterrows():
-                if unmatched_close_qty <= 0:
-                    break
+            # Handle unmatched closes (historical orphans)
+            if unmatched_close_qty > 0:
+                close_only_rows = group[
+                    group["Close Action"].isin(["Buy Close", "Sell Close"])
+                    & group["Open Action"].isna()
+                    & group["Close\nQuantity"].fillna(0).gt(0)
+                ].copy()
 
-                candidate_close_date = candidate.get("Close Date")
-                if pd.isna(candidate_close_date):
-                    continue
+                if not close_only_rows.empty:
+                    close_only_rows = close_only_rows.sort_values(by=["Close Date", "Close\nQuantity"], ascending=[True, False])
 
-                # Validation Issues is intended for historical orphan closes.
-                # Keep current-year rows on their primary trade sheet only.
-                if getattr(candidate_close_date, "year", None) is None or int(candidate_close_date.year) >= this_year:
-                    continue
+                    for _, candidate in close_only_rows.iterrows():
+                        if unmatched_close_qty <= 0:
+                            break
 
-                if expiration_dt is None or expiration_dt.date() >= datetime.date.today():
-                    continue
+                        candidate_close_date = candidate.get("Close Date")
+                        if pd.isna(candidate_close_date):
+                            continue
 
-                qty = int(candidate.get("Close\nQuantity") or 0)
-                if qty <= 0:
-                    continue
+                        # Validation Issues is intended for historical orphan closes.
+                        # Keep current-year rows on their primary trade sheet only.
+                        if getattr(candidate_close_date, "year", None) is None or int(candidate_close_date.year) >= this_year:
+                            continue
 
-                issue_row = candidate.to_dict()
-                issue_row["ValidationIssueType"] = "historical_orphan_close"
-                issue_row["ValidationReason"] = "Close exists without enough matching open quantity; contract expiration is in the past."
-                issues.append(issue_row)
-                unmatched_close_qty -= qty
+                        if not is_expired:
+                            continue
+
+                        qty = int(candidate.get("Close\nQuantity") or 0)
+                        if qty <= 0:
+                            continue
+
+                        issue_row = candidate.to_dict()
+                        issue_row["ValidationIssueType"] = "historical_orphan_close"
+                        issue_row["ValidationReason"] = "Close exists without enough matching open quantity; contract expiration is in the past."
+                        issues.append(issue_row)
+                        unmatched_close_qty -= qty
+
+            # Handle unmatched opens (expired but unmatched)
+            if unmatched_open_qty > 0 and is_expired:
+                open_only_rows = group[
+                    group["Open Action"].isin(["Buy Open", "Sell Open"])
+                    & group["Close Action"].isna()
+                    & group["Open\nQuantity"].fillna(0).gt(0)
+                ].copy()
+                
+                for _, candidate in open_only_rows.iterrows():
+                    issue_row = candidate.to_dict()
+                    issue_row["ValidationIssueType"] = "expired_unmatched_open"
+                    issue_row["ValidationReason"] = "Option has expired but no matching close was found. Check adjustments.csv for symbol/strike changes."
+                    issues.append(issue_row)
 
         issue_columns = list(df_all.columns) + ["ValidationIssueType", "ValidationReason"]
         if not issues:
@@ -2386,8 +2417,6 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
     adjustments = load_adjustments()
     apply_corporate_actions(opens=opens, closes=closes, adjustments=adjustments)
 
-    add_expired_worthless_orders(opens, closes)
-
     new_trades = match_trades(opens, closes)
     
     # Bring forward historical trades from previous output
@@ -2397,5 +2426,8 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
     
     # Merge and deduplicate
     combined = merge_and_deduplicate(old_trades, new_trades)
+
+    # Report unmatched expired options to the console
+    report_unmatched_expired_trades(combined)
 
     write_excel_output(combined, output_file, tax_props=tax_props)
