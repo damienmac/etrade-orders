@@ -30,6 +30,46 @@ action_map = {
     "SELL": "Sell",
 }
 
+
+def normalize_date_for_key(date_value):
+    parsed_date = parse_mmddyyyy(date_value)
+    if parsed_date:
+        return parsed_date.isoformat()
+
+    raw = str(date_value).strip() if date_value is not None else ""
+    if ' ' in raw:
+        raw = raw.split(' ')[0]
+    return raw
+
+
+def normalize_price_for_key(price_value):
+    if price_value is None:
+        return ""
+    try:
+        price = Decimal(str(price_value))
+        return str(price.normalize())
+    except Exception:
+        return str(price_value)
+
+
+def normalize_order_id_for_key(order_id_value):
+    if order_id_value is None:
+        return None
+    raw = str(order_id_value).strip()
+    if raw == "":
+        return None
+
+    # Normalize numerically-equivalent broker IDs loaded from mixed sources
+    # (e.g. 18166, 18166.0, "18166", "18166.0").
+    try:
+        dec = Decimal(raw)
+        if dec == dec.to_integral_value():
+            return str(int(dec))
+        return str(dec.normalize())
+    except Exception:
+        return raw
+
+
 def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
                           account_id_key: str,
                           from_dt: datetime.datetime,
@@ -102,7 +142,7 @@ def fetch_executed_orders(etrade_order: pyetrade.order.ETradeOrder,
                         "price": price,
                         "total_in": total_in,
                         "total_out": total_out,
-                        "order_id": order_id,
+                        "order_id": normalize_order_id_for_key(order_id),
                     }
                     if "Close" in action or "Sell" == action:
                         closes.append(row)
@@ -437,6 +477,67 @@ def link_short_put_assignments(combined: list) -> dict:
     return assignment_links
 
 
+def handle_expired_options(combined_trades: list):
+    """
+    Identifies expired unmatched options. 
+    If they look like normal worthless expirations (no suspicious nearby orphan closes),
+    it creates a synthetic $0.00 closing trade to avoid cluttering the warning log.
+    """
+    now = datetime.datetime.now()
+    
+    # First, collect all "orphan closes" (trades with only a close leg) by date
+    orphan_closes_by_date = defaultdict(list)
+    for trade in combined_trades:
+        if not trade.get('open') and trade.get('close'):
+            c = trade['close']
+            close_date = get_leg_date(c)
+            if close_date:
+                orphan_closes_by_date[close_date].append(trade)
+    
+    for trade in combined_trades:
+        o = trade.get('open')
+        c = trade.get('close')
+        symbol = trade.get('symbol')
+        
+        # We only care about unmatched opens
+        if o and not c:
+            exp_date = parse_expiration_date(symbol)
+            if exp_date and exp_date < now:
+                # This is an expired unmatched option. 
+                # Should we close it synthetically?
+                
+                ticker_details = parse_option_details(symbol)
+                ticker = ticker_details['ticker'] if ticker_details else symbol.split(' ')[0]
+                exp_date_only = exp_date.date()
+                
+                # Check for "suspicious" orphan closes on the same day for a related ticker
+                # This suggests a corporate action (like split or symbol change) might have been missed.
+                all_orphans_on_day = orphan_closes_by_date.get(exp_date_only, [])
+                suspicious_orphans = []
+                for orph in all_orphans_on_day:
+                    orph_symbol = orph.get('symbol', '')
+                    orph_details = parse_option_details(orph_symbol)
+                    orph_ticker = orph_details['ticker'] if orph_details else orph_symbol.split(' ')[0]
+                    
+                    if orph_ticker.startswith(ticker) or ticker.startswith(orph_ticker):
+                        suspicious_orphans.append(orph)
+                
+                if not suspicious_orphans:
+                    # No suspicious orphans found. Likely just expired worthless.
+                    # Create a synthetic close.
+                    synthetic_close = copy.deepcopy(o)
+                    synthetic_close['action'] = "Buy Close" if "Sell" in o.get('action', '') else "Sell Close"
+                    synthetic_close['price'] = Decimal("0.00")
+                    synthetic_close['total_in'] = Decimal("0.00")
+                    synthetic_close['total_out'] = Decimal("0.00")
+                    synthetic_close['date'] = exp_date.strftime("%m/%d/%Y")
+                    synthetic_close['epoch'] = int(exp_date.timestamp() * 1000)
+                    synthetic_close['order_id'] = f"SYNTH-EXP-{normalize_order_id_for_key(o.get('order_id')) or 'UNKNOWN'}"
+                    
+                    trade['close'] = synthetic_close
+                    logger.info(f"Automatically closed expired worthless option: {symbol}")
+
+
 def report_unmatched_expired_trades(combined_trades: list):
     """Reports unmatched expired options to the console to help user identify missing adjustments."""
     now = datetime.datetime.now()
@@ -455,17 +556,15 @@ def report_unmatched_expired_trades(combined_trades: list):
                     msg = "\nWARNING: UNMATCHED EXPIRED OPTIONS FOUND\n" \
                           "These options have passed their expiration date but have no matching closing order.\n" \
                           "This often indicates a missing corporate action in adjustments.csv (e.g., stock split or symbol change)."
-                    print(msg)
                     logger.warning(msg)
                     found_any = True
                 
-                line = f"  - {symbol} (Qty: {o.get('quantity')}, Open Date: {o.get('date')}, Order ID: {o.get('order_id')})"
-                print(line)
+                order_id = normalize_order_id_for_key(o.get('order_id')) or "UNKNOWN"
+                line = f"  - {symbol} (Qty: {o.get('quantity')}, Open Date: {o.get('date')}, Order ID: {order_id})"
                 logger.warning(line)
     
     if found_any:
         footer = "Please check your E*TRADE history and update adjustments.csv if a corporate action occurred.\n"
-        print(footer)
         logger.warning(footer)
 
 
@@ -483,8 +582,8 @@ def match_trades(opens: list, closes: list) -> list:
 
     # Sort by epoch ascending (oldest first)
     # Use a default epoch of 0 if missing (common in some test scenarios)
-    sorted_opens = sorted(opens, key=lambda x: x.get('epoch', 0))
-    sorted_closes = sorted(closes, key=lambda x: x.get('epoch', 0))
+    sorted_opens = sorted(opens, key=lambda x: (x.get('epoch') or 0))
+    sorted_closes = sorted(closes, key=lambda x: (x.get('epoch') or 0))
 
     for o in sorted_opens:
         opens_by_symbol[o['symbol']].append(copy.deepcopy(o))
@@ -525,7 +624,7 @@ def match_trades(opens: list, closes: list) -> list:
 
             combined.append({
                 "symbol": symbol,
-                "epoch": c.get('epoch', 0), 
+                "epoch": (c.get('epoch') or 0), 
                 "open": matched_o,
                 "close": matched_c
             })
@@ -548,7 +647,7 @@ def match_trades(opens: list, closes: list) -> list:
             o = q_opens.popleft()
             combined.append({
                 "symbol": symbol,
-                "epoch": o.get('epoch', 0),
+                "epoch": (o.get('epoch') or 0),
                 "open": o,
                 "close": None
             })
@@ -558,7 +657,7 @@ def match_trades(opens: list, closes: list) -> list:
             c = q_closes.popleft()
             combined.append({
                 "symbol": symbol,
-                "epoch": c.get('epoch', 0),
+                "epoch": (c.get('epoch') or 0),
                 "open": None,
                 "close": c
             })
@@ -660,10 +759,9 @@ def apply_corporate_actions(opens: list = None, closes: list = None, trades: lis
             matches_underlying = any(symbol.startswith(t + " ") for t in target_tickers)
             
             # Safety: If this is a symbol-changing adjustment and the leg already has the NEW ticker,
-            # and the trade is before the adjustment, we assume it was already processed.
+            # and the trade is before the adjustment, we still proceed to ensure strike normalization
+            # is consistent, but we will skip ratio-based quantity/price adjustments.
             is_adj_new_ticker = adj.get('new_ticker') and adj['new_ticker'].lower() != 'none'
-            if is_adj_new_ticker and symbol.startswith(adj['new_ticker'] + " ") and val_date < adj_date:
-                continue
 
             # Handle post-split non-standard options multiplier correction
             # (only for fresh orders where we assume E*TRADE used 100 multiplier)
@@ -991,7 +1089,7 @@ def load_previous_output(output_file: str) -> list:
                             "price": Decimal(str(row['Open Price'])) if pd.notna(row['Open Price']) else None,
                             "total_in": Decimal(str(row['Open Total In'])) if pd.notna(row['Open Total In']) else 0,
                             "total_out": Decimal(str(row['Open Total Out'])) if pd.notna(row['Open Total Out']) else 0,
-                            "order_id": row.get('Open Order ID') if pd.notna(row.get('Open Order ID')) else None,
+                            "order_id": normalize_order_id_for_key(row.get('Open Order ID')),
                         }
                         # Try to reconstruct epoch from date
                         parsed_open_date = parse_mmddyyyy(row['Open Date'])
@@ -1013,7 +1111,7 @@ def load_previous_output(output_file: str) -> list:
                             "total_in": Decimal(str(row['Close Total In'])) if pd.notna(row['Close Total In']) else 0,
                             "total_out": Decimal(str(row['Close Total Out'])) if pd.notna(row['Close Total Out']) else 0,
                             "is_expired": row.get('EXPIRED') == "EXPIRED",
-                            "order_id": row.get('Close Order ID') if pd.notna(row.get('Close Order ID')) else None,
+                            "order_id": normalize_order_id_for_key(row.get('Close Order ID')),
                         }
                         # Try to reconstruct epoch from date
                         parsed_close_date = parse_mmddyyyy(row['Close Date'])
@@ -1110,42 +1208,6 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
     """
     Merges old and new trades using a hybrid ID and fingerprint approach.
     """
-    def normalize_date_for_key(date_value):
-        parsed_date = parse_mmddyyyy(date_value)
-        if parsed_date:
-            return parsed_date.isoformat()
-
-        raw = str(date_value).strip() if date_value is not None else ""
-        if ' ' in raw:
-            raw = raw.split(' ')[0]
-        return raw
-
-    def normalize_price_for_key(price_value):
-        if price_value is None:
-            return ""
-        try:
-            price = Decimal(str(price_value))
-            return str(price.normalize())
-        except Exception:
-            return str(price_value)
-
-    def normalize_order_id_for_key(order_id_value):
-        if order_id_value is None:
-            return None
-        raw = str(order_id_value).strip()
-        if raw == "":
-            return None
-
-        # Normalize numerically-equivalent broker IDs loaded from mixed sources
-        # (e.g. 18166, 18166.0, "18166", "18166.0").
-        try:
-            dec = Decimal(raw)
-            if dec == dec.to_integral_value():
-                return str(int(dec))
-            return str(dec.normalize())
-        except Exception:
-            return raw
-
     def get_fingerprint(trade_leg):
         if not trade_leg:
             return None
@@ -1173,58 +1235,140 @@ def merge_and_deduplicate(old_trades: list, new_trades: list) -> list:
         return f"{order_id}|{symbol}|{action}|{price_key}|{date_key}"
 
     # We want to keep track of legs (opens and closes) independently to ensure full deduplication
-    seen_order_leg_keys = set()
-    seen_fingerprints = set()
+    # Map from leg_key (id_key or fingerprint) to the trade object in unique_trades
+    leg_to_trade = {}
     
-    unique_trades = []
-    
-    # Process new trades first as they are "fresher" and have Order IDs
-    for trade in new_trades + old_trades:
-        o = trade['open']
-        c = trade['close']
-        
-        # Determine if this trade is "new" to our list
-        # A trade is considered seen if BOTH its legs (if they exist) have been seen
-        legs_seen = 0
-        legs_count = 0
-        
-        if o:
-            legs_count += 1
-            o_id_key = get_order_leg_key(o)
-            o_fp = get_fingerprint(o)
-            if (o_id_key and o_id_key in seen_order_leg_keys) or ((not o_id_key) and (o_fp in seen_fingerprints)):
-                legs_seen += 1
+    def get_trade_completeness(t):
+        score = 0
+        if t.get('open'): score += 1
+        if t.get('close'): score += 1
+        return score
 
+    for trade in new_trades + old_trades:
+        o = trade.get('open')
+        c = trade.get('close')
+        
+        # Collect all keys for this trade's legs
+        current_leg_keys = set()
+        if o:
+            id_key = get_order_leg_key(o)
+            if id_key: current_leg_keys.add(id_key)
+            fp = get_fingerprint(o)
+            if fp: current_leg_keys.add(fp)
         if c:
-            legs_count += 1
-            c_id_key = get_order_leg_key(c)
-            c_fp = get_fingerprint(c)
-            if (c_id_key and c_id_key in seen_order_leg_keys) or ((not c_id_key) and (c_fp in seen_fingerprints)):
-                legs_seen += 1
+            id_key = get_order_leg_key(c)
+            if id_key: current_leg_keys.add(id_key)
+            fp = get_fingerprint(c)
+            if fp: current_leg_keys.add(fp)
+
+        # Check if any of these legs are already represented in our unique set
+        existing_trades = []
+        for key in current_leg_keys:
+            if key in leg_to_trade:
+                et = leg_to_trade[key]
                 
-        if legs_seen < legs_count:
-            # At least one leg is new, so we add this trade
-            unique_trades.append(trade)
+                # Deduplication Rule:
+                # 1. If we matched by Order ID, it's definitely the same leg.
+                # 2. If we matched by Fingerprint, only consider it the same leg if 
+                #    one of the trades lacks an Order ID for that leg.
+                #    If both have different Order IDs, they are distinct legs despite same fingerprint.
+                is_same_leg = False
+                if "|" in key and key.count("|") >= 4:
+                    # This is likely an ID key or Fingerprint key. 
+                    # ID key has order_id at the start.
+                    # Fingerprint key starts with symbol.
+                    # Actually, we can check if the key is in current_leg_keys.
+                    # But we already know 'key' is in current_leg_keys because we are iterating it.
+                    
+                    # More direct check:
+                    is_id_key = False
+                    if o:
+                        if key == get_order_leg_key(o): is_id_key = True
+                    if c:
+                        if key == get_order_leg_key(c): is_id_key = True
+                    
+                    if is_id_key:
+                        is_same_leg = True
+                    else:
+                        # Fingerprint match. Check if either side lacks an order_id.
+                        # We need to find which leg of 'et' matches this fingerprint.
+                        et_o = et.get('open')
+                        et_c = et.get('close')
+                        matched_et_leg = None
+                        if et_o and get_fingerprint(et_o) == key: matched_et_leg = et_o
+                        elif et_c and get_fingerprint(et_c) == key: matched_et_leg = et_c
+                        
+                        # Find which leg of 'trade' matches this fingerprint
+                        matched_new_leg = None
+                        if o and get_fingerprint(o) == key: matched_new_leg = o
+                        elif c and get_fingerprint(c) == key: matched_new_leg = c
+                        
+                        if matched_et_leg and matched_new_leg:
+                            if not matched_et_leg.get('order_id') or not matched_new_leg.get('order_id'):
+                                is_same_leg = True
+                
+                if is_same_leg:
+                    if et not in existing_trades:
+                        existing_trades.append(et)
+        
+        if not existing_trades:
+            # Entirely new trade
+            for key in current_leg_keys:
+                leg_to_trade[key] = trade
+        else:
+            # We have one or more existing trades that share at least one leg with this new one.
+            # Decision: Should we keep the new one or the existing one(s)?
+            # Preference: Most complete trade wins.
+            new_score = get_trade_completeness(trade)
             
-            # Mark legs as seen
-            if o:
-                o_id_key = get_order_leg_key(o)
-                o_fp = get_fingerprint(o)
-                if o_id_key:
-                    seen_order_leg_keys.add(o_id_key)
-                if o_fp:
-                    # Track fingerprints for all accepted legs (including those with
-                    # order IDs) so legacy rows without order IDs can still dedupe
-                    # against the same already-seen broker leg.
-                    seen_fingerprints.add(o_fp)
-            if c:
-                c_id_key = get_order_leg_key(c)
-                c_fp = get_fingerprint(c)
-                if c_id_key:
-                    seen_order_leg_keys.add(c_id_key)
-                if c_fp:
-                    seen_fingerprints.add(c_fp)
+            # If the new trade is better than ALL existing ones it would replace, or equal to them, 
+            # we might want to replace.
+            best_existing_score = max(get_trade_completeness(et) for et in existing_trades)
+            
+            if new_score > best_existing_score:
+                # New one is better! Remove old ones from the leg map and replace.
+                for et in existing_trades:
+                    # Find all keys pointing to this old trade and remove them
+                    keys_to_remove = [k for k, v in leg_to_trade.items() if v is et]
+                    for k in keys_to_remove:
+                        del leg_to_trade[k]
                 
+                # Add new one
+                for key in current_leg_keys:
+                    leg_to_trade[key] = trade
+            else:
+                # Existing is better or equal. Skip new one.
+                # (We don't need to do anything, the existing one stays in the map)
+                pass
+
+    # Extract unique trades from the map
+    unique_trades = []
+    seen_trade_ids = set()
+    # We want to maintain some order, so we iterate through the inputs again or just use the map values
+    # Iterating through inputs ensures new trades come first.
+    for trade in new_trades + old_trades:
+        if id(trade) in seen_trade_ids:
+            continue
+        # Check if this trade is the one we decided to keep for its legs
+        is_kept = False
+        o = trade.get('open')
+        if o:
+            id_key = get_order_leg_key(o)
+            fp = get_fingerprint(o)
+            if (id_key and leg_to_trade.get(id_key) is trade) or (fp and leg_to_trade.get(fp) is trade):
+                is_kept = True
+        
+        c = trade.get('close')
+        if c and not is_kept:
+            id_key = get_order_leg_key(c)
+            fp = get_fingerprint(c)
+            if (id_key and leg_to_trade.get(id_key) is trade) or (fp and leg_to_trade.get(fp) is trade):
+                is_kept = True
+        
+        if is_kept:
+            unique_trades.append(trade)
+            seen_trade_ids.add(id(trade))
+    
     # Reconcile stale/duplicate rows for expired option contracts.
     # 1) Keep legitimate unmatched opens, but drop open-only rows that duplicate
     #    an open leg already represented by a closed row for the same expired symbol.
@@ -2449,6 +2593,9 @@ def orders(consumer_key: str, consumer_secret: str, account_id_key: str, tokens:
     
     # Merge and deduplicate
     combined = merge_and_deduplicate(old_trades, new_trades)
+
+    # Handle expired options (create synthetic closes for worthless expirations)
+    handle_expired_options(combined)
 
     # Report unmatched expired options to the console
     report_unmatched_expired_trades(combined)
